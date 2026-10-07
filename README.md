@@ -169,6 +169,7 @@ flutter test tool/generate_icons_test.dart
 - The app is not sandboxed (see Claude above); `com.apple.security.network.client` stays set in both
   entitlements files in case the sandbox is ever turned back on.
 - The auth token is stored in app preferences (like the web app's `localStorage`), not the Keychain.
-- On Flutter 3.44.1 with the current Xcode, `flutter build macos --release` fails in the Flutter tool's
-  framework-architecture check even for a brand-new blank app (`lipo` lists `x86_64 arm64`, the tool
-  expects `arm64 x86_64`). Debug builds (`flutter run`) are unaffected; try `flutter upgrade` for release.
+- On Flutter 3.44.1, `flutter build macos --release` fails in `release_unpack_macos`: it expects the
+  framework's architectures as `arm64 x86_64`, `lipo` lists `x86_64 arm64`. `Configs/Release.xcconfig`
+  works around it with `ARCHS = arm64` (release builds are for Apple silicon only). Build and install with:
+  `flutter build macos --release && cp -R build/macos/Build/Products/Release/Timmy.app /Applications/`
