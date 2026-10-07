@@ -1,0 +1,109 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# ── Added by Gitty ──
+# Flutter / Dart — Build output
+# Compiled app files — rebuilt every time you run the app.
+build/
+**/Flutter/ephemeral/
+**/Generated.xcconfig
+
+# Flutter / Dart — Tool caches
+# Dart and Flutter keep their working files here.
+.packages
+.flutter-plugins
+
+# Flutter / Dart — Native dependencies
+# Downloaded by CocoaPods and Gradle when you build.
+**/Pods/
+.gradle/
+android/local.properties
+android/key.properties
+
+# Flutter / Dart — Test coverage
+# Reports from `flutter test --coverage`.
+coverage/
+
+# macOS — Finder clutter
+# Folder view settings and thumbnails — never part of your project.
+.AppleDouble
+.LSOverride
+._*
+
+# macOS — Volume files
+# Created on external drives.
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Secrets — Environment files
+# API keys and passwords usually live here. A shareable example file is still allowed.
+.env
+.env.*
+!.env.example
+
+# Secrets — Private keys
+# Certificates and signing keys.
+*.pem
+*.key
+*.p12
+*.keystore
+*.jks
+
+# Editors & IDEs — VS Code
+# Personal settings; shared recommendations are kept.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Editors & IDEs — Vim & Emacs
+# Swap and backup files.
+*.swo
+\#*\#
+
+# Logs — Logs
+# Useful while debugging, noise in history.
+logs/
