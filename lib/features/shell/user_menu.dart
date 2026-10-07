@@ -3,6 +3,10 @@ import 'package:provider/provider.dart';
 
 import '../../models/models.dart';
 import '../../state/auth_controller.dart';
+import '../../state/jira_controller.dart';
+import '../../state/trello_controller.dart';
+import '../jira/jira_tasks_page.dart';
+import '../trello/trello_cards_page.dart';
 
 /// Avatar that opens a menu with the account email and a sign-out action.
 class UserMenu extends StatelessWidget {
@@ -17,7 +21,14 @@ class UserMenu extends StatelessWidget {
       tooltip: user.email,
       offset: const Offset(0, 36),
       onSelected: (value) {
-        if (value == 'logout') context.read<AuthController>().logout();
+        switch (value) {
+          case 'jira':
+            openJiraTasks(context);
+          case 'trello':
+            openTrelloCards(context);
+          case 'logout':
+            context.read<AuthController>().logout();
+        }
       },
       itemBuilder: (context) => [
         PopupMenuItem(
@@ -31,6 +42,27 @@ class UserMenu extends StatelessWidget {
           ),
         ),
         const PopupMenuDivider(),
+        // Only once Jira is connected (Settings → Connectors → Jira).
+        if (context.read<JiraController>().isConnected)
+          const PopupMenuItem(
+            value: 'jira',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.view_kanban_outlined),
+              title: Text('Jira tasks'),
+            ),
+          ),
+        if (context.read<TrelloController>().isConnected)
+          const PopupMenuItem(
+            value: 'trello',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.dashboard_outlined),
+              title: Text('Trello cards'),
+            ),
+          ),
         const PopupMenuItem(
           value: 'logout',
           child: ListTile(

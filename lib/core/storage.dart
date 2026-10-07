@@ -4,8 +4,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
 
-/// Everything the app keeps on disk: the session, the chosen workspace, and
-/// per-workspace timer state (so a running timer survives restarts).
+/// Everything the app keeps on disk: the session, the chosen workspace,
+/// per-workspace timer state (so a running timer survives restarts) and the
+/// Jira connection.
 class AppStorage {
   AppStorage(this._prefs);
 
@@ -62,4 +63,53 @@ class AppStorage {
     Map<String, dynamic> state,
   ) =>
       _prefs.setString(_trackerKey(userId, workspaceId), jsonEncode(state));
+
+  static String _jiraKey(int userId) => 'jira.v1.$userId';
+
+  /// The Jira connection and picker settings for one Timmy user.
+  Map<String, dynamic>? jiraSettings(int userId) {
+    final raw = _prefs.getString(_jiraKey(userId));
+    if (raw == null) return null;
+    try {
+      return jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveJiraSettings(int userId, Map<String, dynamic> settings) =>
+      _prefs.setString(_jiraKey(userId), jsonEncode(settings));
+
+  static const _claudeKey = 'claude.v1';
+
+  /// The Claude Code connector: on/off, CLI location, model and usage log.
+  /// App-wide: the CLI login belongs to the Mac, not to a Timmy user.
+  Map<String, dynamic>? get claudeSettings {
+    final raw = _prefs.getString(_claudeKey);
+    if (raw == null) return null;
+    try {
+      return jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveClaudeSettings(Map<String, dynamic> settings) =>
+      _prefs.setString(_claudeKey, jsonEncode(settings));
+
+  static String _trelloKey(int userId) => 'trello.v1.$userId';
+
+  /// The Trello connection and picker settings for one Timmy user.
+  Map<String, dynamic>? trelloSettings(int userId) {
+    final raw = _prefs.getString(_trelloKey(userId));
+    if (raw == null) return null;
+    try {
+      return jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveTrelloSettings(int userId, Map<String, dynamic> settings) =>
+      _prefs.setString(_trelloKey(userId), jsonEncode(settings));
 }

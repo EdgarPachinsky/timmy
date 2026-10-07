@@ -3,19 +3,24 @@ import 'package:provider/provider.dart';
 
 import '../../core/api_client.dart';
 import '../../core/clock.dart';
+import '../../core/planner.dart';
 import '../../core/storage.dart';
 import '../../models/models.dart';
 import '../../state/auth_controller.dart';
+import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../state/workspaces_controller.dart';
 import '../entries/entries_page.dart';
+import '../plan/plan_page.dart';
 import '../projects/projects_page.dart';
+import '../settings/settings_page.dart';
 import '../tracker/elapsed_text.dart';
 import '../tracker/tracker_page.dart';
 import 'user_menu.dart';
 
-/// The signed-in app for one workspace: a compact top bar, tabs, and the three pages.
+/// The signed-in app for one workspace: a compact top bar, and the Tracker,
+/// Entries and Plan tabs. Projects opens from the top bar.
 class WorkspaceShell extends StatelessWidget {
   const WorkspaceShell({super.key, required this.workspace});
 
@@ -78,6 +83,65 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
     setState(() => _index = _trackerIndex);
   }
 
+  /// Plan → Start: fills the tracker with the task (and the project last used
+  /// for it) and starts the timer; without a known project it stops at the
+  /// form so the user can pick one.
+  void _startFromPlan(PlanItem item) {
+    final tracker = context.read<TrackerController>();
+    final session = context.read<WorkspaceSession>();
+    final jira = context.read<JiraController>();
+    final messenger = ScaffoldMessenger.of(context);
+    if (tracker.isActive) {
+      messenger.showSnackBar(const SnackBar(content: Text('Finish the running timer first.')));
+      return;
+    }
+    final project = session.trackableProjects.where((p) => p.id == item.lastProjectId).firstOrNull ??
+        session.trackableProjects.where((p) => p.id == tracker.projectId).firstOrNull;
+    final task = jira.taskFor(item.issue);
+    tracker.prefill(
+      project: project,
+      title: task.title.length > 500 ? task.title.substring(0, 500) : task.title,
+      description: task.description ?? '',
+    );
+    setState(() => _index = _trackerIndex);
+    if (project == null) {
+      messenger.showSnackBar(SnackBar(content: Text('Pick a project for ${item.issue.key}, then press Start.')));
+      return;
+    }
+    final problem = tracker.start();
+    messenger.showSnackBar(SnackBar(
+      content: Text(problem ?? 'Started ${item.issue.key} on ${project.name}.'),
+    ));
+  }
+
+  /// Projects as its own page; "Track" closes it and preselects the project.
+  Future<void> _openProjects() {
+    final session = context.read<WorkspaceSession>();
+    final theme = Theme.of(context);
+    return Navigator.of(context).push(MaterialPageRoute(
+      builder: (routeContext) => ChangeNotifierProvider.value(
+        value: session,
+        child: Scaffold(
+          appBar: AppBar(
+            toolbarHeight: 44,
+            titleSpacing: 0,
+            centerTitle: false,
+            title: Text(
+              'Projects',
+              style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+          ),
+          body: ProjectsPage(
+            onTrack: (project) {
+              Navigator.pop(routeContext);
+              _trackProject(project);
+            },
+          ),
+        ),
+      ),
+    ));
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -91,6 +155,7 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
             workspace: widget.workspace,
             user: widget.user,
             canSwitch: !tracker.isActive,
+            onOpenProjects: _openProjects,
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
@@ -115,8 +180,8 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
               index: _index,
               children: [
                 const TrackerPage(),
-                ProjectsPage(onTrack: _trackProject),
                 const EntriesPage(),
+                PlanPage(onStart: _startFromPlan),
               ],
             ),
           ),
@@ -128,11 +193,17 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
 
 /// Workspace name and timezone, the switch button, and the account menu.
 class _TopBar extends StatelessWidget {
-  const _TopBar({required this.workspace, required this.user, required this.canSwitch});
+  const _TopBar({
+    required this.workspace,
+    required this.user,
+    required this.canSwitch,
+    required this.onOpenProjects,
+  });
 
   final Workspace workspace;
   final User user;
   final bool canSwitch;
+  final VoidCallback onOpenProjects;
 
   @override
   Widget build(BuildContext context) {
@@ -181,6 +252,18 @@ class _TopBar extends StatelessWidget {
             icon: const Icon(Icons.swap_horiz),
             onPressed: canSwitch ? () => context.read<WorkspacesController>().clearSelection() : null,
           ),
+          IconButton(
+            tooltip: 'Projects',
+            iconSize: 18,
+            icon: const Icon(Icons.folder_outlined),
+            onPressed: onOpenProjects,
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            iconSize: 18,
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => openSettings(context),
+          ),
           const SizedBox(width: 4),
           UserMenu(user: user),
         ],
@@ -189,7 +272,7 @@ class _TopBar extends StatelessWidget {
   }
 }
 
-/// Segmented tab strip for the three pages.
+/// Segmented tab strip: Tracker, Entries and Plan.
 class _Tabs extends StatelessWidget {
   const _Tabs({required this.index, required this.onSelected});
 
@@ -198,8 +281,8 @@ class _Tabs extends StatelessWidget {
 
   static const _items = [
     (Icons.timer_outlined, Icons.timer, 'Tracker'),
-    (Icons.folder_outlined, Icons.folder, 'Projects'),
     (Icons.list_alt_outlined, Icons.list_alt, 'Entries'),
+    (Icons.event_note_outlined, Icons.event_note, 'Plan'),
   ];
 
   @override

@@ -114,6 +114,22 @@ class ApiClient {
         body: payload,
       ) as Map<String, dynamic>);
 
+  /// Updates an entry with `PATCH`; [payload] has the same shape as for
+  /// [createTimeEntry]. Returns the entry as Time-Wise now has it.
+  Future<TimeEntry> updateTimeEntry(
+    int workspaceId,
+    int entryId,
+    Map<String, dynamic> payload,
+  ) async =>
+      TimeEntry.fromJson(await _request(
+        'PATCH',
+        '/api/workspaces/$workspaceId/time-entries/$entryId',
+        body: payload,
+      ) as Map<String, dynamic>);
+
+  Future<void> deleteTimeEntry(int workspaceId, int entryId) =>
+      _request('DELETE', '/api/workspaces/$workspaceId/time-entries/$entryId');
+
   List<T> _list<T>(dynamic json, T Function(Map<String, dynamic>) parse) => [
         for (final item in json as List<dynamic>) parse(item as Map<String, dynamic>),
       ];

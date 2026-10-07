@@ -71,6 +71,8 @@ class FakeBackend {
 
   late final List<Map<String, dynamic>> entries;
   final List<Map<String, dynamic>> postedEntries = [];
+  final List<Map<String, dynamic>> updatedEntries = [];
+  final List<int> deletedEntryIds = [];
   final List<String> requests = [];
 
   /// When true, POSTing a time entry fails with a 500.
@@ -98,6 +100,34 @@ class FakeBackend {
 
     if (req.headers['Authorization'] != 'Bearer tokenString') {
       return _json({'error': 'Unauthorized'}, 401);
+    }
+
+    final update = RegExp(r'^/api/workspaces/36/time-entries/(\d+)$').firstMatch(path);
+    if (req.method == 'DELETE' && update != null) {
+      final id = int.parse(update.group(1)!);
+      final index = entries.indexWhere((e) => e['id'] == id);
+      if (index < 0) return _json({'error': 'Time entry not found'}, 404);
+      entries.removeAt(index);
+      deletedEntryIds.add(id);
+      return _json({'success': true});
+    }
+    if (req.method == 'PATCH' && update != null) {
+      final id = int.parse(update.group(1)!);
+      final index = entries.indexWhere((e) => e['id'] == id);
+      if (index < 0) return _json({'error': 'Time entry not found'}, 404);
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      updatedEntries.add({'id': id, ...body});
+      entries[index] = {
+        ...entries[index],
+        ...body,
+        'totalMinutes': (body['hours'] as int) * 60 + (body['minutes'] as int),
+        'project': body['projectId'] == 38 ? projectWithClient : projectWithoutClient,
+        'tags': [
+          for (final t in demoTags)
+            if ((body['tagIds'] as List).contains(t['id'])) t,
+        ],
+      };
+      return _json(entries[index]);
     }
 
     switch ((req.method, path)) {

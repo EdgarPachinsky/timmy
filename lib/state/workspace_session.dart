@@ -67,6 +67,36 @@ class WorkspaceSession extends ChangeNotifier {
         },
       );
 
+  /// Saves changes to one of the user's entries in Time-Wise, then reloads
+  /// the list. Throws [ApiException] if the server refuses.
+  Future<void> updateEntry(int entryId, Map<String, dynamic> payload) async {
+    await _api.updateTimeEntry(workspace.id, entryId, payload);
+    await loadEntries();
+  }
+
+  /// Deletes one of the user's entries from Time-Wise, then reloads the list.
+  /// Throws [ApiException] if the server refuses.
+  Future<void> deleteEntry(int entryId) async {
+    await _api.deleteTimeEntry(workspace.id, entryId);
+    await loadEntries();
+  }
+
+  /// Puts a just-deleted entry back (as a new entry with the same fields),
+  /// for Undo. Throws [ApiException] if the server refuses.
+  Future<void> restoreEntry(TimeEntry entry) async {
+    await _api.createTimeEntry(workspace.id, {
+      'projectId': entry.projectId,
+      'taskTitle': entry.taskTitle,
+      'description': entry.description,
+      'hours': entry.totalMinutes ~/ 60,
+      'minutes': entry.totalMinutes % 60,
+      'date': entry.date,
+      'billable': entry.billable,
+      'tagIds': [for (final t in entry.tags) t.id]..sort(),
+    });
+    await loadEntries();
+  }
+
   Future<void> _load<T>(
     Loadable<T> Function() get,
     void Function(Loadable<T>) set,

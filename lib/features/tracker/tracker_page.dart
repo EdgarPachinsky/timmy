@@ -1,11 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/format.dart';
 import '../../models/models.dart';
+import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
+import '../../state/trello_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../widgets/common.dart';
+import '../jira/jira_status_menu.dart';
+import '../settings/settings_page.dart';
+import '../tasks/task_picker.dart';
 import 'elapsed_text.dart';
 import 'tracker_logic.dart';
 
@@ -17,15 +24,37 @@ class TrackerPage extends StatefulWidget {
 }
 
 class _TrackerPageState extends State<TrackerPage> {
-  final _formKey = GlobalKey<FormState>();
+  /// Replaced (see [_clearValidation]) to start the form's checks afresh.
+  var _formKey = GlobalKey<FormState>();
+
+  /// Forgets the form's validation state (red fields, "touched" flags)
+  /// without touching its values, by rebuilding the form under a new key.
+  /// (FormState.reset would instead restore the text from the last build.)
+  void _clearValidation() => setState(() => _formKey = GlobalKey<FormState>());
   late final TextEditingController _title;
   late final TextEditingController _description;
   String? _startProblem;
+
+  late final TrackerController _tracker;
+  late int _seenExternalEdits;
+
+  /// The planner (or another screen) filled the form: show its text.
+  void _onTrackerChanged() {
+    if (_tracker.externalEdits == _seenExternalEdits) return;
+    _seenExternalEdits = _tracker.externalEdits;
+    _syncTextFromController(_tracker);
+    if (!mounted) return;
+    _clearValidation();
+    setState(() => _startProblem = null);
+  }
 
   @override
   void initState() {
     super.initState();
     final tracker = context.read<TrackerController>();
+    _tracker = tracker;
+    _seenExternalEdits = tracker.externalEdits;
+    tracker.addListener(_onTrackerChanged);
     _title = TextEditingController(text: tracker.taskTitle);
     _description = TextEditingController(text: tracker.description);
     // Entries left over from a previous run (offline, crash) are retried now.
@@ -36,6 +65,7 @@ class _TrackerPageState extends State<TrackerPage> {
 
   @override
   void dispose() {
+    _tracker.removeListener(_onTrackerChanged);
     _title.dispose();
     _description.dispose();
     super.dispose();
@@ -52,29 +82,98 @@ class _TrackerPageState extends State<TrackerPage> {
     setState(() => _startProblem = tracker.start());
   }
 
-  Future<void> _end(TrackerController tracker) async {
-    if (!_formKey.currentState!.validate()) return;
+  /// Whether the End menu stopped a running timer, so closing the menu
+  /// without a choice (or a choice that can't go through) restarts it.
+  bool _resumeAfterEnd = false;
+
+  /// Pressing End stops the clock while the user picks where the time goes.
+  void _onEndMenuOpened(TrackerController tracker) {
+    _resumeAfterEnd = tracker.isRunning;
+    tracker.pause();
+  }
+
+  void _onEndMenuClosed(TrackerController tracker) {
+    // A pick runs in the same event as the close; let it claim the timer first.
+    scheduleMicrotask(() {
+      if (!_resumeAfterEnd) return;
+      _resumeAfterEnd = false;
+      tracker.resume();
+    });
+  }
+
+  /// "45s" under a minute, otherwise "1h 30m".
+  static String _durationLabel(Duration elapsed) =>
+      elapsed.inSeconds < 60 ? '${elapsed.inSeconds}s' : formatMinutes(roundToMinutes(elapsed));
+
+  /// Ends the timer, uploading to Time-Wise or, with [upload] false, keeping
+  /// the entry on this Mac.
+  Future<void> _end(TrackerController tracker, {required bool upload}) async {
+    final resume = _resumeAfterEnd;
+    _resumeAfterEnd = false;
+    void keepTiming() {
+      if (resume) tracker.resume();
+    }
+
+    if (!_formKey.currentState!.validate()) {
+      keepTiming();
+      return;
+    }
     final messenger = ScaffoldMessenger.of(context);
     final minutes = roundToMinutes(tracker.elapsed);
+    final duration = _durationLabel(tracker.elapsed);
     final project = tracker.projectName;
 
-    final outcome = await tracker.end();
-    _syncTextFromController(tracker);
+    final outcome = await tracker.end(upload: upload);
+    if (outcome == EndOutcome.invalid || outcome == EndOutcome.tooShort) keepTiming();
     if (!mounted) return;
+    _syncTextFromController(tracker);
+    if (outcome != EndOutcome.invalid && outcome != EndOutcome.tooShort) {
+      // The entry is done and the form is empty for the next one: clear the
+      // validation from this End so the blank title doesn't show as an error.
+      _clearValidation();
+    }
     switch (outcome) {
       case EndOutcome.saved:
         messenger.showSnackBar(SnackBar(
           content: Text('Saved ${formatMinutes(minutes)} to $project'),
         ));
+      case EndOutcome.keptLocally:
+        messenger.showSnackBar(SnackBar(
+          content: Text('Kept $duration on this Mac. Upload it from Entries.'),
+        ));
       case EndOutcome.tooShort:
         messenger.showSnackBar(const SnackBar(
-          content: Text('That was under a minute, so nothing was saved.'),
+          content: Text('Time-Wise needs at least a minute. Choose "Keep on this Mac" to save it locally.'),
         ));
       case EndOutcome.invalid:
         messenger.showSnackBar(SnackBar(content: Text(tracker.invalidReason ?? 'Check the form.')));
       case EndOutcome.failed:
         break; // The banner at the top explains and offers a retry.
     }
+  }
+
+  /// Fills the title (and maybe description) from a Jira task or Trello
+  /// card. With nothing connected it opens Settings first.
+  Future<void> _pickTask(TrackerController tracker, RelativeRect position) async {
+    final jira = context.read<JiraController>();
+    final trello = context.read<TrelloController>();
+    if (!hasTaskSource(jira, trello)) {
+      await openSettings(context);
+      if (!mounted || !hasTaskSource(jira, trello)) return;
+    }
+    final task = await pickTask(context, jira: jira, trello: trello, position: position);
+    if (task == null || !mounted) return;
+
+    final title = task.title.length > 500 ? task.title.substring(0, 500) : task.title;
+    _title.text = title;
+    tracker.setTaskTitle(title);
+    final description = task.description;
+    if (description != null && _description.text.trim().isEmpty) {
+      final text = description.length > 1000 ? description.substring(0, 1000) : description;
+      _description.text = text;
+      tracker.setDescription(text);
+    }
+    setState(() => _startProblem = null);
   }
 
   Future<void> _confirmDiscard(TrackerController tracker) async {
@@ -132,7 +231,9 @@ class _TrackerPageState extends State<TrackerPage> {
                     onStart: () => _start(tracker),
                     onPause: tracker.pause,
                     onResume: tracker.resume,
-                    onEnd: () => _end(tracker),
+                    onEnd: (upload) => _end(tracker, upload: upload),
+                    onEndMenuOpened: () => _onEndMenuOpened(tracker),
+                    onEndMenuClosed: () => _onEndMenuClosed(tracker),
                     onDiscard: () => _confirmDiscard(tracker),
                   ),
                 ],
@@ -148,6 +249,7 @@ class _TrackerPageState extends State<TrackerPage> {
                     title: _title,
                     description: _description,
                     onChanged: () => setState(() => _startProblem = null),
+                    onPickTask: (position) => _pickTask(tracker, position),
                   ),
                 ),
               ),
@@ -232,6 +334,8 @@ class _TimerCard extends StatelessWidget {
     required this.onPause,
     required this.onResume,
     required this.onEnd,
+    required this.onEndMenuOpened,
+    required this.onEndMenuClosed,
     required this.onDiscard,
   });
 
@@ -240,7 +344,10 @@ class _TimerCard extends StatelessWidget {
   final VoidCallback onStart;
   final VoidCallback onPause;
   final VoidCallback onResume;
-  final VoidCallback onEnd;
+  /// Ends the timer; `true` uploads to Time-Wise, `false` keeps it locally.
+  final ValueChanged<bool> onEnd;
+  final VoidCallback onEndMenuOpened;
+  final VoidCallback onEndMenuClosed;
   final VoidCallback onDiscard;
 
   String _status() {
@@ -288,12 +395,12 @@ class _TimerCard extends StatelessWidget {
         onPressed: running ? onPause : onResume,
         icon: Icon(running ? Icons.pause_rounded : Icons.play_arrow_rounded),
       ),
-      IconButton.filled(
-        tooltip: 'End & save',
-        onPressed: tracker.saving ? null : onEnd,
+      _EndButton(
         style: big,
-        iconSize: 26,
-        icon: const Icon(Icons.stop_rounded),
+        enabled: !tracker.saving,
+        onEnd: onEnd,
+        onOpen: onEndMenuOpened,
+        onClose: onEndMenuClosed,
       ),
     ];
   }
@@ -357,6 +464,66 @@ class _TimerCard extends StatelessWidget {
   }
 }
 
+/// The stop button. It opens a small menu: upload to Time-Wise now, or keep
+/// the entry on this Mac to upload later from Entries.
+class _EndButton extends StatelessWidget {
+  const _EndButton({
+    required this.style,
+    required this.enabled,
+    required this.onEnd,
+    required this.onOpen,
+    required this.onClose,
+  });
+
+  final ButtonStyle style;
+  final bool enabled;
+  final ValueChanged<bool> onEnd;
+
+  /// The menu opened (the timer is stopped while choosing) / closed.
+  final VoidCallback onOpen;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
+
+    Widget option(String title, String subtitle) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(title, style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+            Text(subtitle, style: theme.textTheme.labelSmall?.copyWith(color: muted)),
+          ],
+        );
+
+    return MenuAnchor(
+      alignmentOffset: const Offset(-150, 4),
+      onOpen: onOpen,
+      onClose: onClose,
+      menuChildren: [
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.cloud_upload_outlined, size: 20),
+          onPressed: () => onEnd(true),
+          child: option('Save to Time-Wise', 'Upload now'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.laptop_mac_outlined, size: 20),
+          onPressed: () => onEnd(false),
+          child: option('Keep on this Mac', 'Upload later from Entries'),
+        ),
+      ],
+      builder: (context, menu, _) => IconButton.filled(
+        tooltip: 'End',
+        onPressed: enabled ? () => menu.isOpen ? menu.close() : menu.open() : null,
+        style: style,
+        iconSize: 26,
+        icon: const Icon(Icons.stop_rounded),
+      ),
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 class _DetailsCard extends StatelessWidget {
@@ -365,17 +532,21 @@ class _DetailsCard extends StatelessWidget {
     required this.title,
     required this.description,
     required this.onChanged,
+    required this.onPickTask,
   });
 
   final TrackerController tracker;
   final TextEditingController title;
   final TextEditingController description;
   final VoidCallback onChanged;
+  /// Pick a Jira task or Trello card; the menu (if any) opens at the position.
+  final ValueChanged<RelativeRect> onPickTask;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final session = context.watch<WorkspaceSession>();
+    final pickTooltip = pickTaskTooltip(context.watch<JiraController>(), context.watch<TrelloController>());
     final projects = session.trackableProjects;
     final selectedProject = projects.any((p) => p.id == tracker.projectId) ? tracker.projectId : null;
 
@@ -424,7 +595,18 @@ class _DetailsCard extends StatelessWidget {
             TextFormField(
               controller: title,
               maxLength: 500,
-              decoration: _fieldDecoration('Task title', Icons.task_alt_outlined).copyWith(counterText: ''),
+              decoration: _fieldDecoration('Task title', Icons.task_alt_outlined).copyWith(
+                counterText: '',
+                suffixIcon: Builder(
+                  builder: (anchor) => IconButton(
+                    tooltip: pickTooltip,
+                    iconSize: 18,
+                    icon: const Icon(Icons.manage_search),
+                    onPressed: () => onPickTask(menuPositionBelow(anchor)),
+                  ),
+                ),
+                suffixIconConstraints: const BoxConstraints(minWidth: 36, minHeight: 34),
+              ),
               textInputAction: TextInputAction.next,
               autovalidateMode: AutovalidateMode.onUserInteraction,
               validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a task title' : null,

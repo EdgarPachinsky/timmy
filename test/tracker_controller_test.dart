@@ -119,6 +119,90 @@ void main() {
     });
   });
 
+  group('keeping on this Mac', () {
+    test('end(upload: false) stores the entry locally without uploading', () async {
+      final t = filled()..start();
+      advance(const Duration(minutes: 45));
+
+      expect(await t.end(upload: false), EndOutcome.keptLocally);
+      expect(api.created, isEmpty);
+      expect(t.pending, isEmpty);
+      expect(t.local.single.minutes, 45);
+      expect(t.local.single.taskTitle, 'CDEV-1');
+      expect(t.phase, TimerPhase.idle);
+
+      // Survives a restart.
+      expect(make().local.single.id, t.local.single.id);
+    });
+
+    test('uploadLocal sends it and removes it once accepted', () async {
+      var saved = 0;
+      final t = make(onSaved: () => saved++)
+        ..setProject(_css)
+        ..setTaskTitle('CDEV-1')
+        ..start();
+      advance(const Duration(minutes: 30));
+      await t.end(upload: false);
+
+      api.failWith = const ApiException('Server down');
+      expect(await t.uploadLocal(t.local.single.id), 'Server down');
+      expect(t.local, hasLength(1));
+
+      api.failWith = null;
+      expect(await t.uploadLocal(t.local.single.id), isNull);
+      expect(t.local, isEmpty);
+      expect(api.created.single['minutes'], 30);
+      expect(saved, 1);
+      expect(make().local, isEmpty);
+    });
+
+    test('updateLocal edits it in place and keeps it across restarts', () async {
+      final t = filled()..start();
+      advance(const Duration(minutes: 40));
+      await t.end(upload: false);
+      final id = t.local.single.id;
+
+      t.updateLocal(id, {
+        ...t.local.single.payload,
+        'taskTitle': 'Renamed',
+        'hours': 1,
+        'minutes': 5,
+      }, projectName: 'CSS');
+
+      expect(t.local.single.id, id);
+      expect(t.local.single.taskTitle, 'Renamed');
+      expect(t.local.single.minutes, 65);
+      expect(make().local.single.taskTitle, 'Renamed');
+    });
+
+    test('restoreLocal undoes a delete in place', () async {
+      final t = filled()..start();
+      advance(const Duration(minutes: 10));
+      await t.end(upload: false);
+      t
+        ..setTaskTitle('Second')
+        ..start();
+      advance(const Duration(minutes: 5));
+      await t.end(upload: false);
+      final first = t.local.first;
+
+      t.deleteLocal(first.id);
+      t.restoreLocal(first, 0);
+      t.restoreLocal(first, 0); // A second Undo is ignored.
+      expect(t.local.map((e) => e.taskTitle), ['CDEV-1', 'Second']);
+    });
+
+    test('deleteLocal drops it without uploading', () async {
+      final t = filled()..start();
+      advance(const Duration(minutes: 10));
+      await t.end(upload: false);
+      t.deleteLocal(t.local.single.id);
+      expect(t.local, isEmpty);
+      expect(api.created, isEmpty);
+      expect(make().local, isEmpty);
+    });
+  });
+
   group('ending', () {
     test('uploads exactly the payload the API expects', () async {
       final t = make()
@@ -188,12 +272,29 @@ void main() {
       expect(api.created.single['minutes'], 2);
     });
 
-    test('under 30 seconds is discarded without a request', () async {
+    test('under 30 seconds is not uploaded and the timer is kept', () async {
       final t = filled()..start();
       advance(const Duration(seconds: 20));
       expect(await t.end(), EndOutcome.tooShort);
       expect(api.created, isEmpty);
+      expect(t.phase, TimerPhase.running);
+      expect(t.elapsed, const Duration(seconds: 20));
+    });
+
+    test('under a minute can be kept on this Mac, then uploaded as 1 minute', () async {
+      final t = filled()..start();
+      advance(const Duration(seconds: 20));
+      expect(await t.end(upload: false), EndOutcome.keptLocally);
       expect(t.phase, TimerPhase.idle);
+      final entry = t.local.single;
+      expect(entry.seconds, 20);
+      expect(entry.minutes, 0);
+      expect(entry.underAMinute, isTrue);
+      expect(make().local.single.seconds, 20);
+
+      expect(await t.uploadLocal(entry.id), isNull);
+      expect(api.created.single['hours'], 0);
+      expect(api.created.single['minutes'], 1);
     });
 
     test('more than 24h is split across days', () async {

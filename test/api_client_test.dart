@@ -143,4 +143,74 @@ void main() {
       ..token = 'old';
     expect(await api.refreshToken(), 'fresh');
   });
+
+  test('updateTimeEntry PATCHes the entry and parses the reply', () async {
+    late http.Request seen;
+    final api = clientFor((req) async {
+      seen = req;
+      return json({
+        'id': 4622,
+        'workspaceId': 36,
+        'projectId': 38,
+        'userId': 64,
+        'taskTitle': 'CDEV-2450',
+        'description': 'fixing EDI issues',
+        'hours': 1,
+        'minutes': 46,
+        'totalMinutes': 106,
+        'date': '2026-10-07',
+        'billable': true,
+        'project': {
+          'id': 38,
+          'workspaceId': 36,
+          'name': 'CSS',
+          'description': null,
+          'color': '#10b981',
+          'status': 'active',
+          'memberCount': 0,
+          'totalMinutes': 0,
+          'createdAt': '2026-06-18T10:41:37.260Z',
+        },
+        'tags': [
+          {'id': 87, 'workspaceId': 36, 'name': 'Bug', 'color': '#ef4444', 'createdAt': '2026-06-18T10:50:13.074Z'},
+        ],
+        'createdAt': '2026-10-07T13:54:10.734Z',
+      });
+    })
+      ..token = 'tokenString';
+
+    final payload = {
+      'billable': true,
+      'date': '2026-10-07',
+      'description': 'fixing EDI issues',
+      'hours': 1,
+      'minutes': 46,
+      'projectId': 38,
+      'tagIds': [87],
+      'taskTitle': 'CDEV-2450',
+    };
+    final entry = await api.updateTimeEntry(36, 4622, payload);
+
+    expect(seen.method, 'PATCH');
+    expect(seen.url.toString(), 'https://api.test/api/workspaces/36/time-entries/4622');
+    expect(seen.headers['Authorization'], 'Bearer tokenString');
+    expect(jsonDecode(seen.body), payload);
+    expect(entry.id, 4622);
+    expect(entry.totalMinutes, 106);
+    expect(entry.tags.single.name, 'Bug');
+  });
+
+  test('deleteTimeEntry sends DELETE to the entry', () async {
+    late http.Request seen;
+    final api = clientFor((req) async {
+      seen = req;
+      return http.Response('', 204);
+    })
+      ..token = 'tokenString';
+
+    await api.deleteTimeEntry(36, 4649);
+    expect(seen.method, 'DELETE');
+    expect(seen.url.toString(), 'https://api.test/api/workspaces/36/time-entries/4649');
+    expect(seen.headers['Authorization'], 'Bearer tokenString');
+  });
 }

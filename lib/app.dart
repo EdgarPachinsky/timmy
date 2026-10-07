@@ -2,20 +2,43 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'core/api_client.dart';
+import 'core/claude_cli.dart';
 import 'core/clock.dart';
+import 'core/jira_client.dart';
 import 'core/storage.dart';
+import 'core/trello_client.dart';
 import 'features/auth/login_screen.dart';
 import 'features/shell/workspace_shell.dart';
 import 'features/workspaces/workspaces_screen.dart';
 import 'state/auth_controller.dart';
+import 'state/claude_controller.dart';
+import 'state/jira_controller.dart';
+import 'state/trello_controller.dart';
 import 'state/workspaces_controller.dart';
 import 'widgets/timmy_logo.dart';
 
 class TimmyApp extends StatelessWidget {
-  const TimmyApp({super.key, required this.api, required this.storage, this.clock});
+  const TimmyApp({
+    super.key,
+    required this.api,
+    required this.storage,
+    this.clock,
+    this.jira,
+    this.claude,
+    this.trello,
+  });
 
   final ApiClient api;
   final AppStorage storage;
+
+  /// Defaults to a client on the real network.
+  final JiraClient? jira;
+
+  /// Defaults to the Claude Code CLI installed on this Mac.
+  final ClaudeCli? claude;
+
+  /// Defaults to a client on the real network.
+  final TrelloClient? trello;
 
   /// Defaults to the system clock.
   final Clock? clock;
@@ -27,6 +50,15 @@ class TimmyApp extends StatelessWidget {
         Provider<ApiClient>.value(value: api),
         Provider<AppStorage>.value(value: storage),
         Provider<Clock>.value(value: clock ?? DateTime.now),
+        Provider<JiraClient>(create: (_) => jira ?? JiraClient()),
+        Provider<TrelloClient>(create: (_) => trello ?? TrelloClient()),
+        // App-wide: the Claude Code login belongs to the Mac, not a Timmy user.
+        ChangeNotifierProvider(
+          create: (context) => ClaudeController(
+            cli: claude ?? ClaudeCli(),
+            storage: context.read<AppStorage>(),
+          ),
+        ),
         ChangeNotifierProvider(
           create: (_) => AuthController(api, storage)..restore(),
         ),
@@ -125,9 +157,27 @@ class _SignedIn extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (context) =>
-          WorkspacesController(context.read<ApiClient>(), context.read<AppStorage>())..load(),
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(
+          create: (context) => JiraController(
+            client: context.read<JiraClient>(),
+            storage: context.read<AppStorage>(),
+            userId: context.read<AuthController>().user!.id,
+          ),
+        ),
+        ChangeNotifierProvider(
+          create: (context) => TrelloController(
+            client: context.read<TrelloClient>(),
+            storage: context.read<AppStorage>(),
+            userId: context.read<AuthController>().user!.id,
+          ),
+        ),
+        ChangeNotifierProvider(
+          create: (context) =>
+              WorkspacesController(context.read<ApiClient>(), context.read<AppStorage>())..load(),
+        ),
+      ],
       child: Consumer<WorkspacesController>(
         builder: (context, workspaces, _) {
           final selected = workspaces.selected;

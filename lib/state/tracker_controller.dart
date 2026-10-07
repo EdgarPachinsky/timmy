@@ -12,29 +12,78 @@ enum TimerPhase { idle, running, paused }
 
 /// Result of ending the timer:
 /// - [invalid]: a required field is missing; the timer keeps running.
-/// - [tooShort]: under a minute, nothing to save; the timer was discarded.
+/// - [tooShort]: under a minute, which Time-Wise won't accept; nothing was
+///   uploaded and the timer is left as it was (it can still be kept locally).
 /// - [saved]: uploaded.
 /// - [failed]: upload failed; the entry stays queued for retry.
-enum EndOutcome { invalid, tooShort, saved, failed }
+/// - [keptLocally]: stored on this Mac only, to upload later from Entries.
+enum EndOutcome { invalid, tooShort, saved, failed, keptLocally }
 
-/// A finished timer waiting to be uploaded. Kept on disk until the server
-/// accepts it, so tracked time is never lost to a network error.
+/// A finished timer that isn't in Time-Wise yet: either queued for upload
+/// (kept on disk until the server accepts it, so time is never lost to a
+/// network error) or kept locally on purpose until the user uploads it.
 class PendingEntry {
-  const PendingEntry({required this.payload, required this.projectName});
+  const PendingEntry({
+    required this.payload,
+    required this.projectName,
+    this.id = '',
+    this.createdAt,
+    this.seconds,
+  });
 
   /// Exactly the JSON body for `POST /workspaces/:id/time-entries`.
   final Map<String, dynamic> payload;
   final String projectName;
 
-  int get minutes => (payload['hours'] as int) * 60 + (payload['minutes'] as int);
-  String get taskTitle => payload['taskTitle'] as String;
-  String get date => payload['date'] as String;
+  /// Identifies a locally kept entry for upload or deletion.
+  final String id;
 
-  Map<String, dynamic> toJson() => {'payload': payload, 'projectName': projectName};
+  /// When the timer was ended.
+  final DateTime? createdAt;
+
+  /// Exact tracked seconds, for entries kept locally under a minute (their
+  /// payload says 0 minutes; they're uploaded as Time-Wise's 1-minute minimum).
+  final int? seconds;
+
+  /// True for a local entry shorter than a minute.
+  bool get underAMinute => minutes == 0;
+
+  int get minutes => (payload['hours'] as int) * 60 + (payload['minutes'] as int);
+  int get projectId => payload['projectId'] as int;
+  String get taskTitle => payload['taskTitle'] as String;
+  String? get description => payload['description'] as String?;
+  String get date => payload['date'] as String;
+  bool get billable => payload['billable'] as bool? ?? false;
+  List<int> get tagIds => [for (final id in payload['tagIds'] as List? ?? const []) id as int];
+
+  /// Shaped like a server entry, for lists, totals and the planner.
+  TimeEntry asTimeEntry({Project? project}) => TimeEntry(
+        id: -1,
+        projectId: projectId,
+        project: project,
+        taskTitle: taskTitle,
+        description: description,
+        totalMinutes: minutes,
+        date: date,
+        billable: billable,
+        tags: const [],
+        createdAt: createdAt,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'payload': payload,
+        'projectName': projectName,
+        'id': id,
+        'createdAt': createdAt?.toIso8601String(),
+        'seconds': seconds,
+      };
 
   factory PendingEntry.fromJson(Map<String, dynamic> json) => PendingEntry(
         payload: Map<String, dynamic>.from(json['payload'] as Map),
         projectName: json['projectName'] as String? ?? '',
+        id: json['id'] as String? ?? '',
+        createdAt: json['createdAt'] == null ? null : DateTime.tryParse(json['createdAt'] as String),
+        seconds: json['seconds'] as int?,
       );
 }
 
@@ -92,6 +141,15 @@ class TrackerController extends ChangeNotifier {
   bool saving = false;
   String? saveError;
 
+  // ---- Kept on this Mac -----------------------------------------------
+
+  /// Entries ended with "Keep on this Mac", newest last. Never uploaded
+  /// automatically.
+  final List<PendingEntry> local = [];
+
+  /// Ids of [local] entries being uploaded right now.
+  final Set<String> uploadingLocal = {};
+
   /// Why the last [end] call returned [EndOutcome.invalid].
   String? invalidReason;
 
@@ -147,6 +205,24 @@ class TrackerController extends ChangeNotifier {
     _changed();
   }
 
+  /// Bumped when something other than the form (e.g. the planner) fills it,
+  /// so the form's text fields know to refresh.
+  int externalEdits = 0;
+
+  /// Fills the form for a new task from elsewhere in the app. Only while no
+  /// timer is running.
+  void prefill({Project? project, required String title, String? description}) {
+    if (isActive) return;
+    if (project != null) {
+      projectId = project.id;
+      projectName = project.name;
+    }
+    taskTitle = title;
+    if (description != null) this.description = description;
+    externalEdits++;
+    _changed();
+  }
+
   // ---- Timer controls -------------------------------------------------
 
   /// Starts the timer. Returns a user-facing problem, or `null` on success.
@@ -197,11 +273,12 @@ class TrackerController extends ChangeNotifier {
     _changed();
   }
 
-  /// Stops the timer and uploads the tracked time.
+  /// Stops the timer and saves the tracked time.
   ///
-  /// The entry is queued on disk first, then sent; if the upload fails it stays
-  /// queued and [saveError] explains why.
-  Future<EndOutcome> end() async {
+  /// With [upload] the entry is queued on disk first, then sent; if the upload
+  /// fails it stays queued and [saveError] explains why. Without it the entry
+  /// is kept in [local] until [uploadLocal] is called.
+  Future<EndOutcome> end({bool upload = true}) async {
     if (!isActive) return EndOutcome.saved;
     final minutes = roundToMinutes(elapsed);
     final id = projectId;
@@ -218,16 +295,20 @@ class TrackerController extends ChangeNotifier {
       return EndOutcome.invalid;
     }
 
-    if (minutes < 1) {
-      _resetTimer();
-      date = null;
-      startTime = null;
-      _changed();
-      return EndOutcome.tooShort;
-    }
+    // Time-Wise needs at least a minute; this Mac can keep anything.
+    final seconds = elapsed.inSeconds;
+    if (upload ? minutes < 1 : seconds < 1) return EndOutcome.tooShort;
 
-    for (final chunk in splitIntoEntries(startedAt ?? _now(), minutes)) {
-      pending.add(PendingEntry(
+    final endedAt = _now();
+    final chunks = minutes < 1
+        ? [EntryChunk(dateOnly(startedAt ?? endedAt), 0)]
+        : splitIntoEntries(startedAt ?? endedAt, minutes);
+    for (var i = 0; i < chunks.length; i++) {
+      final chunk = chunks[i];
+      (upload ? pending : local).add(PendingEntry(
+        id: '${endedAt.microsecondsSinceEpoch}-$i',
+        createdAt: endedAt,
+        seconds: minutes < 1 ? seconds : null,
         projectName: projectName,
         payload: {
           'projectId': id!,
@@ -251,7 +332,75 @@ class TrackerController extends ChangeNotifier {
     startTime = null;
     _changed();
 
+    if (!upload) return EndOutcome.keptLocally;
     return await flushPending() ? EndOutcome.saved : EndOutcome.failed;
+  }
+
+  // ---- Kept on this Mac -----------------------------------------------
+
+  /// Uploads one locally kept entry. Returns a user-facing error, or null
+  /// once Time-Wise has it (it then leaves [local]).
+  Future<String?> uploadLocal(String id) async {
+    final entry = local.where((e) => e.id == id).firstOrNull;
+    if (entry == null || uploadingLocal.contains(id)) return null;
+    uploadingLocal.add(id);
+    _notify();
+    try {
+      await _api.createTimeEntry(
+        _workspace.id,
+        // Under a minute goes up as Time-Wise's minimum of one minute.
+        entry.underAMinute ? {...entry.payload, 'minutes': 1} : entry.payload,
+      );
+      local.removeWhere((e) => e.id == id);
+      _persist();
+      onEntrySaved?.call();
+      return null;
+    } on ApiException catch (e) {
+      return e.message;
+    } finally {
+      uploadingLocal.remove(id);
+      _notify();
+    }
+  }
+
+  /// Uploads every locally kept entry, oldest first, stopping at the first
+  /// failure. Returns its error, or null when all are uploaded.
+  Future<String?> uploadAllLocal() async {
+    for (final entry in [...local]) {
+      final error = await uploadLocal(entry.id);
+      if (error != null) return error;
+    }
+    return null;
+  }
+
+  /// Replaces a locally kept entry's fields with [payload] (same shape as an
+  /// upload). An entry left at 0 minutes keeps its exact seconds.
+  void updateLocal(String id, Map<String, dynamic> payload, {required String projectName}) {
+    final i = local.indexWhere((e) => e.id == id);
+    if (i < 0) return;
+    final old = local[i];
+    final stillShort = (payload['hours'] as int) == 0 && (payload['minutes'] as int) == 0;
+    local[i] = PendingEntry(
+      id: old.id,
+      createdAt: old.createdAt,
+      projectName: projectName,
+      payload: payload,
+      seconds: stillShort ? old.seconds : null,
+    );
+    _changed();
+  }
+
+  /// Deletes a locally kept entry without uploading it.
+  void deleteLocal(String id) {
+    local.removeWhere((e) => e.id == id);
+    _changed();
+  }
+
+  /// Puts a just-deleted local entry back where it was, for Undo.
+  void restoreLocal(PendingEntry entry, int index) {
+    if (local.any((e) => e.id == entry.id)) return;
+    local.insert(index.clamp(0, local.length), entry);
+    _changed();
   }
 
   // ---- Upload queue ---------------------------------------------------
@@ -320,6 +469,7 @@ class TrackerController extends ChangeNotifier {
       'accumulatedMs': _accumulated.inMilliseconds,
       'resumedAt': _resumedAt?.toIso8601String(),
       'pending': [for (final p in pending) p.toJson()],
+      'local': [for (final p in local) p.toJson()],
     }));
   }
 
@@ -344,6 +494,10 @@ class TrackerController extends ChangeNotifier {
         for (final p in (s['pending'] as List? ?? const []))
           PendingEntry.fromJson(p as Map<String, dynamic>),
       ]);
+      local.addAll([
+        for (final p in (s['local'] as List? ?? const []))
+          PendingEntry.fromJson(p as Map<String, dynamic>),
+      ]);
 
       final savedPhase = TimerPhase.values.asNameMap()[s['phase']] ?? TimerPhase.idle;
       if (savedPhase != TimerPhase.idle) {
@@ -358,6 +512,7 @@ class TrackerController extends ChangeNotifier {
       // Corrupt saved state: start fresh rather than crash on launch.
       _resetTimer();
       pending.clear();
+      local.clear();
     }
   }
 
