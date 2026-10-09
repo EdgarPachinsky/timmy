@@ -4,40 +4,96 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/api_client.dart';
 import '../../core/claude_cli.dart';
 import '../../core/format.dart';
 import '../../core/jira_client.dart';
 import '../../core/planner.dart';
+import '../../core/trello_client.dart';
 import '../../models/jira.dart';
 import '../../models/models.dart';
+import '../../models/trello.dart';
 import '../../state/claude_controller.dart';
 import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
+import '../../state/trello_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../widgets/common.dart';
+import '../entries/entry_editor.dart';
 import '../jira/jira_task_list.dart';
 import '../jira/jira_tasks_page.dart';
 import '../settings/claude_connector_page.dart';
 import '../settings/jira_connector_page.dart';
+import '../settings/trello_connector_page.dart';
+import '../trello/trello_cards_page.dart';
 import '../tracker/tracker_logic.dart';
 import 'standup_dialog.dart';
+import 'step_progress.dart';
 
-/// Today's plan from your Jira tasks: what to work on, how long, and
-/// heads-ups; optionally ordered by Claude, plus a one-click standup.
+/// Today's plan from your Jira tasks, Trello cards and the work in your recent
+/// entries: what to work on, how long, and heads-ups; optionally ordered by
+/// Claude, plus a one-click standup.
 class PlanPage extends StatefulWidget {
-  const PlanPage({super.key, required this.onStart});
+  const PlanPage({super.key, required this.onStart, this.onPlan, this.onStandup});
 
   /// Start tracking [item] (fills the tracker and switches to it).
   final ValueChanged<PlanItem> onStart;
+
+  /// Today's plan whenever it changes.
+  final ValueChanged<List<PlanItem>?>? onPlan;
+
+  /// A standup was written (by Claude, or copied).
+  final ValueChanged<String>? onStandup;
 
   @override
   State<PlanPage> createState() => _PlanPageState();
 }
 
 class _PlanPageState extends State<PlanPage> {
+  /// Null until loaded (or while that source isn't connected).
   List<JiraIssue>? _issues;
+  List<TrelloCard>? _cards;
   bool _loading = false;
-  String? _error;
+
+  /// Per source, why the last load failed.
+  String? _jiraError;
+  String? _trelloError;
+
+  /// Which sources the loaded data is for, to reload when that changes.
+  String? _loadedFor;
+
+  /// Jira issues your recent entries name that aren't on your open list
+  /// (often done by now), with their real status; and which keys they're for.
+  List<JiraIssue> _related = const [];
+  String? _relatedFor;
+  bool _relatedLoading = false;
+
+  /// Looks up the Jira keys in your recent entries that aren't open tasks,
+  /// so done tickets don't come back as "recent work".
+  Future<void> _loadRelated(Set<String> keys) async {
+    final jira = context.read<JiraController>();
+    if (!jira.isConnected) return;
+    _relatedLoading = true;
+    try {
+      final issues = keys.isEmpty ? const <JiraIssue>[] : await jira.issuesByKeys(keys);
+      if (mounted) setState(() => _related = issues);
+    } on JiraException {
+      // Without statuses, those entries are still kept out of recent work.
+    } finally {
+      _relatedLoading = false;
+    }
+  }
+
+  /// Keys named in recent entries that aren't among the open [issues].
+  static Set<String> _keysToLookUp(List<TimeEntry> entries, List<JiraIssue> issues, DateTime now) {
+    final open = {for (final i in issues) i.key.toUpperCase()};
+    return {
+      for (final k in recentJiraKeys(entries, now))
+        if (!open.contains(k.toUpperCase())) k.toUpperCase(),
+    };
+  }
+
+  static String _signature(Set<String> keys) => (keys.toList()..sort()).join(',');
 
   /// Claude's plan, for the day it was made.
   List<ClaudePlanStep>? _aiSteps;
@@ -45,77 +101,370 @@ class _PlanPageState extends State<PlanPage> {
   DateTime? _aiDay;
   bool _aiLoading = false;
 
+  /// The step shown under the Claude button while planning: what's being
+  /// done, whether it's finished, and whether it went fine.
+  ProgressStep? _progress;
+
   bool _showLater = false;
   bool _showWaiting = false;
 
-  Future<void> _load() async {
-    final jira = context.read<JiraController>();
-    if (!jira.isConnected || _loading) return;
-    setState(() {
-      _loading = true;
-      _error = null;
+  /// What [PlanPage.onPlan] was last told, to report only changes.
+  String? _reportedPlan;
+
+  void _reportPlan(List<PlanItem>? items) {
+    final signature = items == null
+        ? 'none'
+        : [for (final i in items) '${i.task.ref}:${i.task.title}:${i.suggestedMinutes}'].join('|');
+    if (signature == _reportedPlan || widget.onPlan == null) return;
+    _reportedPlan = signature;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.onPlan!(items);
     });
-    try {
-      final issues = await jira.findTasks('', refresh: true);
-      if (mounted) setState(() => _issues = issues);
-    } on JiraException catch (e) {
-      if (mounted) setState(() => _error = e.message);
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
   }
 
-  Future<void> _askClaude(DayPlan plan) async {
-    final claude = context.read<ClaudeController>();
-    final messenger = ScaffoldMessenger.of(context);
+  static String _sources(JiraController jira, TrelloController trello) =>
+      '${jira.isConnected}/${trello.isConnected}';
+
+  /// Loads the connected sources side by side; one failing doesn't stop the
+  /// other, and the plan still has your recent work.
+  Future<void> _load() async {
+    final jira = context.read<JiraController>();
+    final trello = context.read<TrelloController>();
+    if (_loading) return;
+    _loadedFor = _sources(jira, trello);
+    setState(() {
+      _loading = true;
+      _jiraError = null;
+      _trelloError = null;
+      if (!jira.isConnected) {
+        _issues = null;
+        _related = const [];
+        _relatedFor = null;
+      }
+      if (!trello.isConnected) _cards = null;
+    });
+    await Future.wait([
+      if (jira.isConnected)
+        () async {
+          try {
+            final issues = await jira.findTasks('', refresh: true);
+            if (mounted) setState(() => _issues = issues);
+          } on JiraException catch (e) {
+            if (mounted) setState(() => _jiraError = e.message);
+          }
+        }(),
+      if (trello.isConnected)
+        () async {
+          try {
+            final cards = await trello.findCards('', refresh: true);
+            if (mounted) setState(() => _cards = cards);
+          } on TrelloException catch (e) {
+            if (mounted) setState(() => _trelloError = e.message);
+          }
+        }(),
+    ]);
+    if (mounted) setState(() => _loading = false);
+  }
+
+  /// Fresh data, step by step: Jira tickets, Trello cards, then your entries
+  /// (and the status of done tickets they name). Each step shows through
+  /// [step]; a source that fails is marked and the rest carries on.
+  Future<void> _gather(StepRunner step) async {
+    final jira = context.read<JiraController>();
+    final trello = context.read<TrelloController>();
+    final session = context.read<WorkspaceSession>();
+    if (jira.isConnected) {
+      await step('Gathering Jira tickets', () async {
+        try {
+          final issues = await jira.findTasks('', refresh: true);
+          if (mounted) {
+            setState(() {
+              _issues = issues;
+              _jiraError = null;
+            });
+          }
+          return true;
+        } on JiraException catch (e) {
+          if (mounted) setState(() => _jiraError = e.message);
+          return false;
+        }
+      });
+    }
+    if (trello.isConnected) {
+      await step('Getting tasks from Trello', () async {
+        try {
+          final cards = await trello.findCards('', refresh: true);
+          if (mounted) {
+            setState(() {
+              _cards = cards;
+              _trelloError = null;
+            });
+          }
+          return true;
+        } on TrelloException catch (e) {
+          if (mounted) setState(() => _trelloError = e.message);
+          return false;
+        }
+      });
+    }
+    await step('Reading your recent entries', () async {
+      await session.loadEntries();
+      // Tickets named there that aren't open (e.g. done): their status.
+      final issues = _issues;
+      if (jira.isConnected && issues != null && session.entries.data != null) {
+        final keys = _keysToLookUp(session.entries.data!, issues, DateTime.now());
+        _relatedFor = _signature(keys);
+        await _loadRelated(keys);
+      }
+      return session.entries.error == null;
+    });
+  }
+
+  /// Fresh data, then the standup's material from it (with Claude's plan for
+  /// today, if there is one).
+  Future<StandupData?> _prepareStandup(StepRunner step) async {
+    await _gather(step);
+    if (!mounted) return null;
     final now = DateTime.now();
+    final session = context.read<WorkspaceSession>();
+    final tracker = context.read<TrackerController>();
+    var plan = _simplePlan(
+      jira: context.read<JiraController>(),
+      trello: context.read<TrelloController>(),
+      session: session,
+      tracker: tracker,
+      now: now,
+    );
+    final steps = _aiSteps;
+    if (steps != null && _aiDay == dateOnly(now)) plan = applyClaudePlan(plan, steps, _aiNote);
+    final entries = <TimeEntry>[
+      ...?session.entries.data,
+      for (final p in tracker.local) p.asTimeEntry(),
+    ];
+    return standupData(entries, plan, now);
+  }
+
+  /// Plans with Claude in visible steps: fresh Jira tickets, Trello cards
+  /// and entries first, then Claude. Each step shows a spinner, then a check,
+  /// then gives way to the next.
+  Future<void> _askClaude() async {
+    final claude = context.read<ClaudeController>();
+    final jira = context.read<JiraController>();
+    final trello = context.read<TrelloController>();
+    final session = context.read<WorkspaceSession>();
+    final tracker = context.read<TrackerController>();
+    final messenger = ScaffoldMessenger.of(context);
     setState(() => _aiLoading = true);
+
+    final step = stepRunner(mounted: () => mounted, show: (s) => setState(() => _progress = s));
+
     try {
-      final answer = await claude.ask(
-        kind: 'plan',
-        instruction: claudePlanInstruction,
-        input: _prettyJson(claudePlanInput(plan, now)),
-        schema: claudePlanSchema,
-      );
-      final structured = answer.structured;
-      if (structured == null) throw const ClaudeException('Claude didn\'t return a plan.');
+      await _gather(step);
       if (!mounted) return;
-      setState(() {
-        _aiSteps = parseClaudePlan(structured);
-        _aiNote = structured['note'] as String? ?? '';
-        _aiDay = dateOnly(now);
+
+      await step('Claude is planning your day', () async {
+        final now = DateTime.now();
+        final plan = _simplePlan(jira: jira, trello: trello, session: session, tracker: tracker, now: now);
+        final answer = await claude.ask(
+          kind: 'plan',
+          instruction: claudePlanInstruction,
+          input: _prettyJson(claudePlanInput(plan, now)),
+          schema: claudePlanSchema,
+        );
+        final structured = answer.structured;
+        if (structured == null) throw const ClaudeException('Claude didn\'t return a plan.');
+        if (mounted) {
+          setState(() {
+            _aiSteps = parseClaudePlan(structured);
+            _aiNote = structured['note'] as String? ?? '';
+            _aiDay = dateOnly(now);
+          });
+        }
+        return true;
       });
     } on ClaudeException catch (e) {
       messenger.showSnackBar(SnackBar(content: Text("Claude couldn't plan: ${e.message}")));
     } finally {
-      if (mounted) setState(() => _aiLoading = false);
+      if (mounted) {
+        setState(() {
+          _aiLoading = false;
+          _progress = null;
+        });
+      }
     }
   }
 
-  void _openIssue(PlanItem item) {
-    final jira = context.read<JiraController>();
-    showJiraIssueDetails(context, jira, item.issue, onMoved: _load);
+  /// The rule-based plan from what's loaded (before Claude reorders it).
+  DayPlan _simplePlan({
+    required JiraController jira,
+    required TrelloController trello,
+    required WorkspaceSession session,
+    required TrackerController tracker,
+    required DateTime now,
+  }) {
+    final entries = <TimeEntry>[
+      ...?session.entries.data,
+      for (final p in tracker.local) p.asTimeEntry(),
+    ];
+    return buildDayPlan(
+      issues: jira.isConnected ? _issues ?? const [] : const [],
+      cards: trello.isConnected ? _cards ?? const [] : const [],
+      relatedIssues: jira.isConnected ? _related : const [],
+      jiraConnected: jira.isConnected,
+      entries: entries,
+      now: now,
+      myAccountId: jira.accountId,
+      trelloMemberId: trello.member?.id,
+      runningMinutes: tracker.isActive ? roundToMinutes(tracker.elapsed) : 0,
+      localEntryCount: tracker.local.length,
+    );
+  }
+
+  /// Logs [item]'s planned time as a real entry: "Add time" filled with the
+  /// task (titled as the pickers would), its planned time, today and the
+  /// project it was last tracked on; it goes to Time-Wise or this Mac.
+  Future<void> _logTime(PlanItem item) {
+    final picked = _entryTextFor(item.task);
+    return addTimeManually(
+      context,
+      draft: EntryDraft(
+        projectId: item.lastProjectId,
+        title: picked.title.length > 500 ? picked.title.substring(0, 500) : picked.title,
+        description: picked.description,
+        minutes: item.suggestedMinutes,
+        date: DateTime.now(),
+      ),
+    );
+  }
+
+  /// What an entry for [task] is called: the same title (and description)
+  /// the task pickers would give it.
+  ({String title, String? description}) _entryTextFor(PlanTask task) {
+    final ({String title, String? description}) picked = task.jira != null
+        ? context.read<JiraController>().taskFor(task.jira!)
+        : task.trello != null
+            ? context.read<TrelloController>().taskFor(task.trello!)
+            : (title: task.title, description: null);
+    final title = picked.title.trim();
+    return (title: title.length > 500 ? title.substring(0, 500) : title, description: picked.description);
+  }
+
+  /// A task can be logged until it has time today (no duplicates).
+  static bool _canLog(PlanItem item) => item.loggedTodayMinutes == 0;
+
+  bool _bulkLogging = false;
+
+  /// Logs every task planned for today that has no time yet straight to
+  /// Time-Wise, each on the project it was last tracked on (else the
+  /// tracker's), with Undo.
+  Future<void> _logAll(List<PlanItem> items) async {
+    if (_bulkLogging) return;
+    final session = context.read<WorkspaceSession>();
+    final tracker = context.read<TrackerController>();
+    final messenger = ScaffoldMessenger.of(context);
+    final projects = session.trackableProjects;
+    bool trackable(int? id) => id != null && projects.any((p) => p.id == id);
+
+    final today = dateKey(DateTime.now());
+    final payloads = <Map<String, dynamic>>[];
+    final skipped = <String>[];
+    for (final item in items.where(_canLog)) {
+      final projectId = trackable(item.lastProjectId)
+          ? item.lastProjectId
+          : trackable(tracker.projectId)
+              ? tracker.projectId
+              : null;
+      if (projectId == null || item.suggestedMinutes < 1) {
+        skipped.add(item.task.shortName);
+        continue;
+      }
+      final text = _entryTextFor(item.task);
+      final description = text.description?.trim() ?? '';
+      payloads.add({
+        'projectId': projectId,
+        'taskTitle': text.title,
+        'description': description.isEmpty ? null : description,
+        'hours': item.suggestedMinutes ~/ 60,
+        'minutes': item.suggestedMinutes % 60,
+        'date': today,
+        'billable': tracker.billable,
+        'tagIds': <int>[],
+      });
+    }
+    if (payloads.isEmpty) {
+      messenger.showSnackBar(SnackBar(
+        content: Text(skipped.isEmpty
+            ? 'Nothing to log: every planned task already has time today.'
+            : 'Pick a project in the tracker first, then try again.'),
+      ));
+      return;
+    }
+
+    setState(() => _bulkLogging = true);
+    try {
+      final result = await session.createEntries(payloads);
+      final created = result.created;
+      final minutes = created.fold<int>(0, (sum, e) => sum + e.totalMinutes);
+      final parts = [
+        if (created.isNotEmpty)
+          'Logged ${created.length} ${created.length == 1 ? 'task' : 'tasks'} '
+              '(${formatMinutes(minutes)}) to Time-Wise.',
+        if (result.error != null) "Couldn't log the rest: ${result.error}",
+        if (skipped.isNotEmpty) 'Skipped ${skipped.join(', ')} (no project).',
+      ];
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(SnackBar(
+        content: Text(parts.join(' ')),
+        persist: false,
+        duration: const Duration(seconds: 6),
+        action: created.isEmpty
+            ? null
+            : SnackBarAction(
+                label: 'Undo',
+                onPressed: () async {
+                  try {
+                    await session.deleteEntries([for (final e in created) e.id]);
+                  } on ApiException catch (e) {
+                    messenger.showSnackBar(SnackBar(content: Text("Couldn't undo: ${e.message}")));
+                  }
+                },
+              ),
+      ));
+    } finally {
+      if (mounted) setState(() => _bulkLogging = false);
+    }
+  }
+
+  /// Details of the Jira issue or Trello card; recent work has none.
+  void _openTask(PlanItem item) {
+    final task = item.task;
+    if (task.jira != null) {
+      showJiraIssueDetails(context, context.read<JiraController>(), task.jira!, onMoved: _load);
+    } else if (task.trello != null) {
+      showTrelloCardDetails(context, task.trello!);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final jira = context.watch<JiraController>();
+    final trello = context.watch<TrelloController>();
     final claude = context.watch<ClaudeController>();
     final session = context.watch<WorkspaceSession>();
     final tracker = context.watch<TrackerController>();
 
-    if (!jira.isConnected) {
-      return _NotConnected(onConnect: () => openJiraConnector(context));
+    // First visit, or Jira / Trello connected or disconnected since.
+    if (!_loading && _loadedFor != _sources(jira, trello)) {
+      _loadedFor = _sources(jira, trello);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _load();
+      });
     }
-    if (_issues == null && !_loading && _error == null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _load());
-    }
-    final issues = _issues;
-    if (issues == null) {
-      return _error != null
-          ? ErrorState(message: _error!, onRetry: _load)
-          : const Center(child: CircularProgressIndicator());
+    final waitingFirstLoad = (jira.isConnected && _issues == null && _jiraError == null) ||
+        (trello.isConnected && _cards == null && _trelloError == null);
+    if (waitingFirstLoad || (session.entries.data == null && session.entries.loading)) {
+      return const Center(child: CircularProgressIndicator());
     }
 
     final now = DateTime.now();
@@ -123,16 +472,21 @@ class _PlanPageState extends State<PlanPage> {
       ...?session.entries.data,
       for (final p in tracker.local) p.asTimeEntry(),
     ];
-    var plan = buildDayPlan(
-      issues: issues,
-      entries: entries,
-      now: now,
-      myAccountId: jira.accountId,
-      runningMinutes: tracker.isActive ? roundToMinutes(tracker.elapsed) : 0,
-      localEntryCount: tracker.local.length,
-    );
+    // Jira keys in recent entries that aren't open tasks: look up their status.
+    final issues = _issues;
+    if (jira.isConnected && issues != null && session.entries.data != null && !_relatedLoading) {
+      final keys = _keysToLookUp(entries, issues, now);
+      if (_signature(keys) != _relatedFor) {
+        _relatedFor = _signature(keys);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _loadRelated(keys);
+        });
+      }
+    }
+    var plan = _simplePlan(jira: jira, trello: trello, session: session, tracker: tracker, now: now);
     final steps = _aiSteps;
     if (steps != null && _aiDay == dateOnly(now)) plan = applyClaudePlan(plan, steps, _aiNote);
+    _reportPlan(plan.today);
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
@@ -155,6 +509,25 @@ class _PlanPageState extends State<PlanPage> {
             ),
           ],
         ),
+        if (!jira.isConnected && !trello.isConnected) ...[
+          _ConnectHint(
+            jira: jira.isConnected,
+            trello: trello.isConnected,
+            onConnectJira: () => openJiraConnector(context),
+            onConnectTrello: () => openTrelloConnector(context),
+          ),
+          const SizedBox(height: 8),
+        ],
+        for (final (name, error) in [('Jira', _jiraError), ('Trello', _trelloError)])
+          if (error != null) ...[
+            InlineNotice(
+              icon: Icons.error_outline,
+              isError: true,
+              message: "Couldn't load $name: $error",
+              actions: [TextButton(onPressed: _loading ? null : _load, child: const Text('Retry'))],
+            ),
+            const SizedBox(height: 8),
+          ],
         _CapacityCard(plan: plan),
         for (final nudge in plan.nudges) ...[
           const SizedBox(height: 6),
@@ -165,10 +538,11 @@ class _PlanPageState extends State<PlanPage> {
           claude: claude,
           plan: plan,
           loading: _aiLoading,
-          onAsk: () => _askClaude(plan),
+          onAsk: _askClaude,
           onReset: () => setState(() => _aiSteps = null),
           onConnect: () => openClaudeConnector(context),
         ),
+        StepProgress(step: _progress),
         if (plan.aiNote != null) ...[
           const SizedBox(height: 8),
           InlineNotice(icon: Icons.auto_awesome, message: plan.aiNote!),
@@ -187,8 +561,8 @@ class _PlanPageState extends State<PlanPage> {
             child: Padding(
               padding: const EdgeInsets.all(14),
               child: Text(
-                issues.isEmpty
-                    ? 'No open Jira tasks are assigned to you.'
+                plan.all.isEmpty
+                    ? 'Nothing to plan yet: no open Jira tasks or Trello cards on you, and no recent work in your entries.'
                     : plan.trackedMinutes >= plan.capacityMinutes
                         ? 'Your day is full. Anything else is under Later.'
                         : 'Nothing to plan right now.',
@@ -201,8 +575,26 @@ class _PlanPageState extends State<PlanPage> {
             items: plan.today,
             numbered: true,
             onStart: widget.onStart,
-            onOpen: _openIssue,
+            onOpen: _openTask,
+            onLog: _logTime,
             canStart: !tracker.isActive,
+          ),
+        if (plan.today.isNotEmpty)
+          Align(
+            alignment: Alignment.centerRight,
+            child: Builder(builder: (context) {
+              final loggable = plan.today.where(_canLog).toList();
+              final minutes = loggable.fold<int>(0, (sum, i) => sum + i.suggestedMinutes);
+              return TextButton.icon(
+                onPressed: loggable.isEmpty || _bulkLogging ? null : () => _logAll(plan.today),
+                icon: _bulkLogging
+                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.cloud_upload_outlined, size: 16),
+                label: Text(loggable.isEmpty
+                    ? 'All planned tasks have time today'
+                    : 'Log all to Time-Wise (${formatMinutes(minutes)})'),
+              );
+            }),
           ),
         if (plan.later.isNotEmpty) ...[
           const SizedBox(height: 10),
@@ -214,7 +606,8 @@ class _PlanPageState extends State<PlanPage> {
             child: _PlanCard(
               items: plan.later,
               onStart: widget.onStart,
-              onOpen: _openIssue,
+              onOpen: _openTask,
+            onLog: _logTime,
               canStart: !tracker.isActive,
             ),
           ),
@@ -229,7 +622,8 @@ class _PlanPageState extends State<PlanPage> {
             child: _PlanCard(
               items: plan.waiting,
               onStart: widget.onStart,
-              onOpen: _openIssue,
+              onOpen: _openTask,
+            onLog: _logTime,
               canStart: !tracker.isActive,
             ),
           ),
@@ -241,6 +635,8 @@ class _PlanPageState extends State<PlanPage> {
             claude: claude,
             data: standupData(entries, plan, now),
             now: now,
+            onWritten: widget.onStandup,
+            prepare: _prepareStandup,
           ),
           icon: const Icon(Icons.record_voice_over_outlined, size: 18),
           label: const Text('Write standup'),
@@ -253,38 +649,30 @@ class _PlanPageState extends State<PlanPage> {
 /// Indented so the input stays readable if someone inspects it.
 final _prettyJson = const JsonEncoder.withIndent('  ').convert;
 
-class _NotConnected extends StatelessWidget {
-  const _NotConnected({required this.onConnect});
+/// Neither Jira nor Trello is connected: the plan comes from recent work in
+/// your entries only; connecting either adds your tasks to it.
+class _ConnectHint extends StatelessWidget {
+  const _ConnectHint({
+    required this.jira,
+    required this.trello,
+    required this.onConnectJira,
+    required this.onConnectTrello,
+  });
 
-  final VoidCallback onConnect;
+  final bool jira;
+  final bool trello;
+  final VoidCallback onConnectJira;
+  final VoidCallback onConnectTrello;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.event_note_outlined, size: 36, color: theme.colorScheme.onSurfaceVariant),
-            const SizedBox(height: 10),
-            Text(
-              'Plan your day from your Jira tasks',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'Connect Jira and Timmy ranks your tasks, fits them into an 8h day and flags what needs attention.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 14),
-            FilledButton(onPressed: onConnect, child: const Text('Connect Jira')),
-          ],
-        ),
-      ),
+    return InlineNotice(
+      icon: Icons.link,
+      message: 'Planning from your recent entries. Connect Jira or Trello to plan from your tasks too.',
+      actions: [
+        if (!jira) TextButton(onPressed: onConnectJira, child: const Text('Connect Jira')),
+        if (!trello) TextButton(onPressed: onConnectTrello, child: const Text('Connect Trello')),
+      ],
     );
   }
 }
@@ -477,7 +865,7 @@ class _ClaudeBar extends StatelessWidget {
                 ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
                 : const Icon(Icons.auto_awesome, size: 16),
             label: Text(loading
-                ? 'Claude is planning…'
+                ? 'Planning with Claude…'
                 : plan.fromClaude
                     ? 'Re-plan with Claude'
                     : 'Ask Claude to plan'),
@@ -567,6 +955,7 @@ class _PlanCard extends StatelessWidget {
     required this.items,
     required this.onStart,
     required this.onOpen,
+    required this.onLog,
     required this.canStart,
     this.numbered = false,
   });
@@ -574,6 +963,9 @@ class _PlanCard extends StatelessWidget {
   final List<PlanItem> items;
   final ValueChanged<PlanItem> onStart;
   final ValueChanged<PlanItem> onOpen;
+
+  /// Log the planned time as an entry.
+  final ValueChanged<PlanItem> onLog;
   final bool canStart;
   final bool numbered;
 
@@ -591,6 +983,7 @@ class _PlanCard extends StatelessWidget {
               canStart: canStart,
               onStart: () => onStart(items[i]),
               onOpen: () => onOpen(items[i]),
+              onLog: () => onLog(items[i]),
             ),
           ],
         ],
@@ -607,6 +1000,7 @@ class _PlanRow extends StatelessWidget {
     required this.canStart,
     required this.onStart,
     required this.onOpen,
+    required this.onLog,
   });
 
   final PlanItem item;
@@ -614,21 +1008,25 @@ class _PlanRow extends StatelessWidget {
   final bool canStart;
   final VoidCallback onStart;
   final VoidCallback onOpen;
+  final VoidCallback onLog;
+
+  static const _compact = BoxConstraints.tightFor(width: 32, height: 32);
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final muted = scheme.onSurfaceVariant;
-    final issue = item.issue;
+    final task = item.task;
     final meta = [
-      if (issue.status.isNotEmpty) issue.status,
+      if (task.status.isNotEmpty) task.status,
       ...item.reasons.where((r) => r != 'In progress' && !r.endsWith('priority')),
       if (item.loggedMinutes > 0) '${formatMinutes(item.loggedMinutes)} logged',
     ].join(' · ');
 
     return InkWell(
-      onTap: onOpen,
+      // Recent work has no Jira issue or Trello card to open.
+      onTap: task.source == TaskSource.entries ? null : onOpen,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
         child: Row(
@@ -655,22 +1053,39 @@ class _PlanRow extends StatelessWidget {
                 children: [
                   Row(
                     children: [
-                      JiraTypeIcon(type: issue.issueType),
+                      switch (task.source) {
+                        TaskSource.jira => JiraTypeIcon(type: task.type),
+                        TaskSource.trello =>
+                          Icon(Icons.view_kanban_outlined, size: 14, color: scheme.primary),
+                        TaskSource.entries => Icon(Icons.history, size: 14, color: muted),
+                      },
                       const SizedBox(width: 4),
-                      Text(
-                        issue.key,
-                        style: theme.textTheme.labelSmall?.copyWith(color: scheme.primary, fontWeight: FontWeight.w700),
+                      Flexible(
+                        child: Text(
+                          switch (task.source) {
+                            TaskSource.jira => task.label,
+                            TaskSource.trello =>
+                              [task.label, task.place].where((s) => s.isNotEmpty).join(' · '),
+                            TaskSource.entries => 'Recent work',
+                          },
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: task.source == TaskSource.entries ? muted : scheme.primary,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
                       ),
-                      if (issue.priority.isNotEmpty) ...[
+                      if (task.priority.isNotEmpty) ...[
                         const SizedBox(width: 6),
-                        JiraPriority(name: issue.priority),
+                        JiraPriority(name: task.priority),
                       ],
                       const SizedBox(width: 6),
                       Container(
                         width: 7,
                         height: 7,
                         decoration: BoxDecoration(
-                          color: jiraStatusColor(issue.statusCategory, scheme),
+                          color: jiraStatusColor(task.statusCategory, scheme),
                           shape: BoxShape.circle,
                         ),
                       ),
@@ -678,7 +1093,7 @@ class _PlanRow extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    issue.summary.isEmpty ? '(no title)' : issue.summary,
+                    task.title.isEmpty ? '(no title)' : task.title,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600, height: 1.25),
@@ -700,6 +1115,17 @@ class _PlanRow extends StatelessWidget {
                             ),
                           ),
                         ],
+                      ),
+                    ),
+                  // Recent work: what you last wrote about it.
+                  if (task.source == TaskSource.entries && task.description.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        'Last note: ${task.description}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(color: muted, fontStyle: FontStyle.italic),
                       ),
                     ),
                   if (meta.isNotEmpty)
@@ -726,12 +1152,30 @@ class _PlanRow extends StatelessWidget {
                     style: theme.textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w700),
                   ),
                 ),
-                IconButton(
-                  tooltip: canStart ? 'Start ${issue.key}' : 'Finish the running timer first',
-                  color: scheme.primary,
-                  iconSize: 22,
-                  onPressed: canStart ? onStart : null,
-                  icon: const Icon(Icons.play_circle_outline),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Log the planned time without running the timer.
+                    IconButton(
+                      tooltip: item.loggedTodayMinutes > 0
+                          ? 'Already has time today'
+                          : 'Log ${formatMinutes(item.suggestedMinutes)} as an entry',
+                      color: muted,
+                      iconSize: 20,
+                      constraints: _compact,
+                      padding: EdgeInsets.zero,
+                      // Once it has time today, logging again would duplicate it.
+                      onPressed: item.loggedTodayMinutes > 0 ? null : onLog,
+                      icon: const Icon(Icons.more_time),
+                    ),
+                    IconButton(
+                      tooltip: canStart ? 'Start ${task.shortName}' : 'Finish the running timer first',
+                      color: scheme.primary,
+                      iconSize: 22,
+                      onPressed: canStart ? onStart : null,
+                      icon: const Icon(Icons.play_circle_outline),
+                    ),
+                  ],
                 ),
               ],
             ),

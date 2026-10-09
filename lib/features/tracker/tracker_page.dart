@@ -10,6 +10,7 @@ import '../../state/tracker_controller.dart';
 import '../../state/trello_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../widgets/common.dart';
+import '../entries/entry_editor.dart';
 import '../jira/jira_status_menu.dart';
 import '../settings/settings_page.dart';
 import '../tasks/task_picker.dart';
@@ -176,7 +177,15 @@ class _TrackerPageState extends State<TrackerPage> {
     setState(() => _startProblem = null);
   }
 
-  Future<void> _confirmDiscard(TrackerController tracker) async {
+  /// End menu → Stop without saving. The menu paused the timer; it runs on
+  /// again if the user keeps it.
+  void _stopWithoutSaving(TrackerController tracker) {
+    final resume = _resumeAfterEnd;
+    _resumeAfterEnd = false;
+    _confirmDiscard(tracker, resumeIfKept: resume);
+  }
+
+  Future<void> _confirmDiscard(TrackerController tracker, {bool resumeIfKept = false}) async {
     final discard = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -197,9 +206,12 @@ class _TrackerPageState extends State<TrackerPage> {
         ],
       ),
     );
+    if (!mounted) return;
     if (discard == true) {
       tracker.discard();
       setState(() => _startProblem = null);
+    } else if (resumeIfKept) {
+      tracker.resume();
     }
   }
 
@@ -235,13 +247,19 @@ class _TrackerPageState extends State<TrackerPage> {
                     onEndMenuOpened: () => _onEndMenuOpened(tracker),
                     onEndMenuClosed: () => _onEndMenuClosed(tracker),
                     onDiscard: () => _confirmDiscard(tracker),
+                    onStopWithoutSaving: () => _stopWithoutSaving(tracker),
+                    onAddTime: context.watch<WorkspaceSession>().trackableProjects.isEmpty
+                        ? null
+                        : () => addTimeManually(context),
                   ),
                 ],
               ),
             ),
+            // A fixed card filling the rest of the window: the page doesn't
+            // scroll; only the tags inside it would, if there were many.
             Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
                 child: Form(
                   key: _formKey,
                   child: _DetailsCard(
@@ -337,6 +355,8 @@ class _TimerCard extends StatelessWidget {
     required this.onEndMenuOpened,
     required this.onEndMenuClosed,
     required this.onDiscard,
+    required this.onStopWithoutSaving,
+    required this.onAddTime,
   });
 
   final TrackerController tracker;
@@ -349,6 +369,16 @@ class _TimerCard extends StatelessWidget {
   final VoidCallback onEndMenuOpened;
   final VoidCallback onEndMenuClosed;
   final VoidCallback onDiscard;
+
+  /// End menu → Stop without saving.
+  final VoidCallback onStopWithoutSaving;
+
+  /// Opens "Add time" (time by hand, no timer); null while it can't.
+  final VoidCallback? onAddTime;
+
+  /// The clock row never changes height, whatever the status text or the
+  /// buttons beside it (big clock + two status lines, one with the pill).
+  static const _rowHeight = 74.0;
 
   String _status() {
     final started = tracker.startedAt;
@@ -399,6 +429,7 @@ class _TimerCard extends StatelessWidget {
         style: big,
         enabled: !tracker.saving,
         onEnd: onEnd,
+        onStopWithoutSaving: onStopWithoutSaving,
         onOpen: onEndMenuOpened,
         onClose: onEndMenuClosed,
       ),
@@ -417,41 +448,71 @@ class _TimerCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.centerLeft,
-                        child: ElapsedText(
-                          controller: tracker,
-                          style: theme.textTheme.displaySmall!.copyWith(
-                            fontSize: 34,
-                            height: 1.15,
-                            fontWeight: FontWeight.w300,
-                            color: tracker.isRunning ? scheme.primary : scheme.onSurface,
+            ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: _rowHeight),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerLeft,
+                          child: ElapsedText(
+                            controller: tracker,
+                            style: theme.textTheme.displaySmall!.copyWith(
+                              fontSize: 34,
+                              height: 1.15,
+                              fontWeight: FontWeight.w300,
+                              color: tracker.isRunning ? scheme.primary : scheme.onSurface,
+                            ),
                           ),
                         ),
-                      ),
-                      Text(
-                        _status(),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
-                      ),
-                    ],
+                        // "Add time" sits right after the status, in its flow.
+                        Text.rich(
+                          TextSpan(children: [
+                            TextSpan(text: '${_status()} '),
+                            WidgetSpan(
+                              alignment: PlaceholderAlignment.middle,
+                              // Nudged down a touch to sit on the text's line.
+                              child: Transform.translate(
+                                offset: const Offset(0, 2),
+                                child: Tooltip(
+                                  message: 'Add time manually, without the timer',
+                                  // A small tinted pill, so it reads as a button.
+                                  child: FilledButton.tonalIcon(
+                                    onPressed: onAddTime,
+                                    style: FilledButton.styleFrom(
+                                      minimumSize: const Size(0, 18),
+                                      padding: const EdgeInsets.fromLTRB(6, 0, 8, 0),
+                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      visualDensity: VisualDensity.compact,
+                                      shape: const StadiumBorder(),
+                                      textStyle: theme.textTheme.labelSmall?.copyWith(fontWeight: FontWeight.w600),
+                                    ),
+                                    icon: const Icon(Icons.add, size: 12),
+                                    label: const Text('Add manually'),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ]),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                for (var i = 0; i < buttons.length; i++) ...[
-                  if (i > 0) const SizedBox(width: 4),
-                  buttons[i],
+                  const SizedBox(width: 8),
+                  for (var i = 0; i < buttons.length; i++) ...[
+                    if (i > 0) const SizedBox(width: 4),
+                    buttons[i],
+                  ],
                 ],
-              ],
+              ),
             ),
             if (problem != null) ...[
               const SizedBox(height: 6),
@@ -464,13 +525,14 @@ class _TimerCard extends StatelessWidget {
   }
 }
 
-/// The stop button. It opens a small menu: upload to Time-Wise now, or keep
-/// the entry on this Mac to upload later from Entries.
+/// The stop button. It opens a small menu: upload to Time-Wise now, keep the
+/// entry on this Mac to upload later from Entries, or stop without saving.
 class _EndButton extends StatelessWidget {
   const _EndButton({
     required this.style,
     required this.enabled,
     required this.onEnd,
+    required this.onStopWithoutSaving,
     required this.onOpen,
     required this.onClose,
   });
@@ -478,6 +540,7 @@ class _EndButton extends StatelessWidget {
   final ButtonStyle style;
   final bool enabled;
   final ValueChanged<bool> onEnd;
+  final VoidCallback onStopWithoutSaving;
 
   /// The menu opened (the timer is stopped while choosing) / closed.
   final VoidCallback onOpen;
@@ -487,12 +550,13 @@ class _EndButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final muted = theme.colorScheme.onSurfaceVariant;
+    final danger = theme.colorScheme.error;
 
-    Widget option(String title, String subtitle) => Column(
+    Widget option(String title, String subtitle, {Color? color}) => Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(title, style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+            Text(title, style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600, color: color)),
             Text(subtitle, style: theme.textTheme.labelSmall?.copyWith(color: muted)),
           ],
         );
@@ -511,6 +575,12 @@ class _EndButton extends StatelessWidget {
           leadingIcon: const Icon(Icons.laptop_mac_outlined, size: 20),
           onPressed: () => onEnd(false),
           child: option('Keep on this Mac', 'Upload later from Entries'),
+        ),
+        const Divider(height: 9),
+        MenuItemButton(
+          leadingIcon: Icon(Icons.delete_outline, size: 20, color: danger),
+          onPressed: onStopWithoutSaving,
+          child: option('Stop without saving', 'Clear the timer, nothing is saved', color: danger),
         ),
       ],
       builder: (context, menu, _) => IconButton.filled(
@@ -632,7 +702,11 @@ class _DetailsCard extends StatelessWidget {
               style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
             ),
             const SizedBox(height: 4),
-            _TagPicker(tracker: tracker, session: session),
+            Expanded(
+              child: SingleChildScrollView(
+                child: _TagPicker(tracker: tracker, session: session),
+              ),
+            ),
             const SizedBox(height: 4),
             SwitchListTile(
               dense: true,

@@ -390,6 +390,20 @@ class TrackerController extends ChangeNotifier {
     _changed();
   }
 
+  /// Keeps a new entry on this Mac from a ready [payload] ("Copy for today",
+  /// "Add time"). [seconds] carries the exact time of an entry under a minute.
+  void addLocal(Map<String, dynamic> payload, {required String projectName, int? seconds}) {
+    final now = _now();
+    local.add(PendingEntry(
+      id: '${now.microsecondsSinceEpoch}-added',
+      createdAt: now,
+      projectName: projectName,
+      payload: payload,
+      seconds: seconds,
+    ));
+    _changed();
+  }
+
   /// Deletes a locally kept entry without uploading it.
   void deleteLocal(String id) {
     local.removeWhere((e) => e.id == id);

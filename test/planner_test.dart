@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:timmy/core/planner.dart';
 import 'package:timmy/models/jira.dart';
 import 'package:timmy/models/models.dart';
+import 'package:timmy/models/trello.dart';
 
 final _now = DateTime(2026, 10, 8, 10, 0);
 
@@ -32,11 +33,13 @@ JiraIssue _issue(
       originalEstimateMinutes: original,
     );
 
-TimeEntry _entry(String title, int minutes, {String date = '2026-10-08', int projectId = 38}) => TimeEntry(
+TimeEntry _entry(String title, int minutes, {String date = '2026-10-08', int projectId = 38, String? note}) =>
+    TimeEntry(
       id: 1,
       projectId: projectId,
       project: const Project(id: 38, name: 'CSS', color: Color(0xFF10B981), status: 'active'),
       taskTitle: title,
+      description: note,
       totalMinutes: minutes,
       date: date,
       billable: true,
@@ -73,10 +76,10 @@ void main() {
       now: _now,
       myAccountId: 'me',
     );
-    expect(plan.today.map((i) => i.issue.key), ['A-3', 'A-2', 'A-1']);
+    expect(plan.today.map((i) => i.task.ref), ['A-3', 'A-2', 'A-1']);
     expect(plan.today.first.reasons, containsAll(['Highest priority', 'Overdue 1d']));
-    expect(plan.waiting.single.issue.key, 'A-4');
-    expect([...plan.today, ...plan.later, ...plan.waiting].map((i) => i.issue.key), isNot(contains('A-5')));
+    expect(plan.waiting.single.task.ref, 'A-4');
+    expect([...plan.today, ...plan.later, ...plan.waiting].map((i) => i.task.ref), isNot(contains('A-5')));
   });
 
   test('fills only the free part of an 8h day; the rest waits for later', () {
@@ -90,8 +93,8 @@ void main() {
       now: _now,
     );
     expect(plan.trackedMinutes, 360);
-    expect(plan.today.map((i) => (i.issue.key, i.suggestedMinutes)), [('A-1', 90), ('A-2', 30)]);
-    expect(plan.later.single.issue.key, 'A-3');
+    expect(plan.today.map((i) => (i.task.ref, i.suggestedMinutes)), [('A-1', 90), ('A-2', 30)]);
+    expect(plan.later.single.task.ref, 'A-3');
     expect(plan.freeMinutes, 0);
   });
 
@@ -151,11 +154,11 @@ void main() {
       'note': 'Start with A-2.',
     });
     final ai = applyClaudePlan(plan, steps, 'Start with A-2.');
-    expect(ai.today.single.issue.key, 'A-2');
+    expect(ai.today.single.task.ref, 'A-2');
     expect(ai.today.single.suggestedMinutes, 45);
     expect(ai.today.single.aiReason, 'Unblocks the team');
-    expect(ai.later.single.issue.key, 'A-1');
-    expect(ai.waiting.single.issue.key, 'A-3');
+    expect(ai.later.single.task.ref, 'A-1');
+    expect(ai.waiting.single.task.ref, 'A-3');
     expect(ai.fromClaude, isTrue);
     expect(claudePlanInput(plan, _now)['tasks'], hasLength(3));
   });
@@ -180,5 +183,103 @@ void main() {
     expect(text, contains('• A-9 Next thing'));
     expect(text, contains('Blockers:'));
     expect(text, isNot(contains('Old stuff')));
+  });
+
+  group('Trello and recent work', () {
+    TrelloCard card(String id, String name, String list, {List<String> labels = const [], String member = 'm1'}) =>
+        TrelloCard(
+          id: id,
+          name: name,
+          idShort: 7,
+          boardName: 'Web',
+          listName: list,
+          labels: [for (final l in labels) TrelloLabel(name: l, color: 'red')],
+          memberIds: [member],
+        );
+
+    test('Trello cards on you join the plan; done lists are skipped, review waits', () {
+      final plan = buildDayPlan(
+        cards: [
+          card('c1', 'Checkout page', 'Doing', labels: ['Urgent']),
+          card('c2', 'Shipped thing', 'Done'),
+          card('c3', 'Banner', 'Code review'),
+          card('c4', "Someone else's", 'To do', member: 'm2'),
+        ],
+        entries: const [],
+        now: _now,
+        trelloMemberId: 'm1',
+      );
+      final first = plan.today.single;
+      expect(first.task.source, TaskSource.trello);
+      expect(first.task.label, '#7');
+      expect(first.reasons, containsAll(['Highest priority', 'In progress']));
+      expect(plan.waiting.single.task.title, 'Banner');
+      expect(plan.all.map((i) => i.task.title), isNot(contains("Someone else's")));
+    });
+
+    test('recent work comes from entries that are no Jira or Trello task, with the last note', () {
+      final plan = buildDayPlan(
+        issues: [_issue('A-1', priority: 'Low')],
+        entries: [
+          _entry('Refactor auth', 120, date: '2026-10-06', note: 'split the service'),
+          _entry('refactor  auth', 60, date: '2026-10-07', note: 'tests left'),
+          _entry('A-1 work', 30, date: '2026-10-07'),
+          _entry('Daily standup', 15, date: '2026-10-07'),
+          _entry('Ancient', 60, date: '2026-09-01'),
+        ],
+        now: _now,
+      );
+      final work = plan.all.where((i) => i.task.source == TaskSource.entries).toList();
+      expect(work.single.task.title, 'refactor  auth');
+      expect(work.single.task.description, 'tests left');
+      expect(work.single.task.ref, startsWith('WORK-'));
+      expect(work.single.reasons, ['Worked on yesterday']);
+      expect(work.single.suggestedMinutes, 90); // 180m over 2 days.
+      // Claude can answer with the ref.
+      final ai = applyClaudePlan(plan, [ClaudePlanStep(key: work.single.task.ref, minutes: 60, reason: 'Finish')], '');
+      expect(ai.today.single.task.title, 'refactor  auth');
+      expect(claudePlanInput(plan, _now)['tasks'], contains(containsPair('lastNote', 'tests left')));
+    });
+
+    test('the standup links work to its task status and lists blockers', () {
+      final plan = buildDayPlan(
+        issues: [
+          _issue('A-1', status: 'Code Review', category: 'indeterminate'),
+          _issue('A-2', summary: 'Payments', status: 'Blocked', category: 'indeterminate'),
+        ],
+        entries: const [],
+        now: _now,
+      );
+      final data = standupData([_entry('A-1 login fix', 90, date: '2026-10-07', note: 'added tests')], plan, _now);
+      final text = standupTemplate(data, _now);
+      expect(text, contains('• A-1 login fix — added tests (1h 30m) · now Code Review'));
+      expect(text, contains('• A-2 Payments (Blocked)'));
+      final input = standupInput(data, _now);
+      expect((input['previousWorkdayWork'] as List).single['task']['status'], 'Code Review');
+      expect(input['blocked'], hasLength(1));
+    });
+
+    test("done Jira tickets named in entries aren't recent work; the standup knows they're done", () {
+      final entries = [
+        _entry('CDEV-2517', 315, date: '2026-10-07', note: 'fixing custom tab view tabs'),
+        _entry('Refactor auth', 60, date: '2026-10-07'),
+      ];
+      expect(recentJiraKeys(entries, _now), {'CDEV-2517'});
+      final plan = buildDayPlan(
+        issues: [_issue('A-1')],
+        relatedIssues: [_issue('CDEV-2517', summary: 'Custom tabs', status: 'Done', category: 'done')],
+        jiraConnected: true,
+        entries: entries,
+        now: _now,
+      );
+      expect(plan.all.map((i) => i.task.title), isNot(contains('CDEV-2517')));
+      expect(plan.all.where((i) => i.task.source == TaskSource.entries).single.task.title, 'Refactor auth');
+      final text = standupTemplate(standupData(entries, plan, _now), _now);
+      expect(text, contains('• CDEV-2517 — fixing custom tab view tabs (5h 15m) · now Done'));
+
+      // Even when Jira couldn't say what it is, a keyed entry stays Jira's.
+      final noLookup = buildDayPlan(entries: entries, now: _now, jiraConnected: true);
+      expect(noLookup.all.map((i) => i.task.title), ['Refactor auth']);
+    });
   });
 }

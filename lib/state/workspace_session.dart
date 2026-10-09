@@ -83,19 +83,55 @@ class WorkspaceSession extends ChangeNotifier {
 
   /// Puts a just-deleted entry back (as a new entry with the same fields),
   /// for Undo. Throws [ApiException] if the server refuses.
-  Future<void> restoreEntry(TimeEntry entry) async {
-    await _api.createTimeEntry(workspace.id, {
-      'projectId': entry.projectId,
-      'taskTitle': entry.taskTitle,
-      'description': entry.description,
-      'hours': entry.totalMinutes ~/ 60,
-      'minutes': entry.totalMinutes % 60,
-      'date': entry.date,
-      'billable': entry.billable,
-      'tagIds': [for (final t in entry.tags) t.id]..sort(),
-    });
+  Future<void> restoreEntry(TimeEntry entry) => createEntry(entryPayload(entry));
+
+  /// Creates an entry from a `POST /time-entries` body, then reloads the
+  /// list. Throws [ApiException] if the server refuses.
+  Future<void> createEntry(Map<String, dynamic> payload) async {
+    await _api.createTimeEntry(workspace.id, payload);
     await loadEntries();
   }
+
+  /// Creates entries one by one, stopping at the first failure, then reloads
+  /// once. Returns what was created and, if it stopped early, why.
+  Future<({List<TimeEntry> created, String? error})> createEntries(List<Map<String, dynamic>> payloads) async {
+    final created = <TimeEntry>[];
+    String? error;
+    for (final payload in payloads) {
+      try {
+        created.add(await _api.createTimeEntry(workspace.id, payload));
+      } on ApiException catch (e) {
+        error = e.message;
+        break;
+      }
+    }
+    if (created.isNotEmpty) await loadEntries();
+    return (created: created, error: error);
+  }
+
+  /// Deletes several entries (e.g. Undo of a bulk add), then reloads once.
+  /// Throws [ApiException] if the server refuses one.
+  Future<void> deleteEntries(Iterable<int> entryIds) async {
+    try {
+      for (final id in entryIds) {
+        await _api.deleteTimeEntry(workspace.id, id);
+      }
+    } finally {
+      await loadEntries();
+    }
+  }
+
+  /// The create/update body for [entry]'s fields, optionally on another [date].
+  static Map<String, dynamic> entryPayload(TimeEntry entry, {String? date}) => {
+        'projectId': entry.projectId,
+        'taskTitle': entry.taskTitle,
+        'description': entry.description,
+        'hours': entry.totalMinutes ~/ 60,
+        'minutes': entry.totalMinutes % 60,
+        'date': date ?? entry.date,
+        'billable': entry.billable,
+        'tagIds': [for (final t in entry.tags) t.id]..sort(),
+      };
 
   Future<void> _load<T>(
     Loadable<T> Function() get,

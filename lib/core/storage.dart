@@ -112,4 +112,21 @@ class AppStorage {
 
   Future<void> saveTrelloSettings(int userId, Map<String, dynamic> settings) =>
       _prefs.setString(_trelloKey(userId), jsonEncode(settings));
+
+  static String _standupKey(int userId) => 'standup.v1.$userId';
+
+  /// The last standup written for one Timmy user, for the menu bar.
+  ({String text, DateTime at})? lastStandup(int userId) {
+    final raw = _prefs.getString(_standupKey(userId));
+    if (raw == null) return null;
+    try {
+      final json = jsonDecode(raw) as Map<String, dynamic>;
+      return (text: json['text'] as String, at: DateTime.parse(json['at'] as String));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveLastStandup(int userId, String text, DateTime at) => _prefs.setString(
+      _standupKey(userId), jsonEncode({'text': text, 'at': at.toIso8601String()}));
 }

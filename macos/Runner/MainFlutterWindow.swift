@@ -18,6 +18,8 @@ class MainFlutterWindow: NSWindow {
     self.center()
 
     RegisterGeneratedPlugins(registry: flutterViewController)
+    StatusItemController.shared.attach(
+      messenger: flutterViewController.engine.binaryMessenger, window: self)
 
     super.awakeFromNib()
   }

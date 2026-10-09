@@ -4,16 +4,162 @@ import 'package:intl/intl.dart';
 
 import '../models/jira.dart';
 import '../models/models.dart';
+import '../models/trello.dart';
 import 'format.dart';
 import 'overtime.dart';
 
 /// A day's worth of planned work (the same 8h as the overtime rule).
 const dayCapacityMinutes = regularDayMinutes;
 
+/// Where a task in the plan comes from.
+enum TaskSource {
+  jira,
+  trello,
+
+  /// Work you've been tracking that isn't a Jira or Trello task, found from
+  /// your recent time entries (their titles and descriptions).
+  entries,
+}
+
+/// A task to plan, whatever its source: a Jira issue, a Trello card, or
+/// recent work from your time entries.
+class PlanTask {
+  const PlanTask({
+    required this.source,
+    required this.ref,
+    required this.title,
+    this.label = '',
+    this.description = '',
+    this.status = '',
+    this.statusCategory = 'new',
+    this.type = '',
+    this.priority = '',
+    this.place = '',
+    this.due,
+    this.assignedAt,
+    this.originalEstimateMinutes,
+    this.remainingEstimateMinutes,
+    this.timeSpentMinutes,
+    this.lastWorked,
+    this.daysWorked = 0,
+    this.jira,
+    this.trello,
+  });
+
+  final TaskSource source;
+
+  /// Stable id, also what Claude answers with: the Jira key, `TRELLO-<id>`
+  /// or `WORK-<hash of the title>`. Upper case.
+  final String ref;
+
+  /// Short tag before the title: the Jira key, the Trello card number
+  /// ("#42"), or empty for recent work.
+  final String label;
+  final String title;
+
+  /// Plain text: the Jira or Trello description, or the latest note from
+  /// your entries for recent work.
+  final String description;
+
+  /// Jira status or Trello list name; empty for recent work.
+  final String status;
+
+  /// `new`, `indeterminate` (in progress) or `done`, like Jira's.
+  final String statusCategory;
+
+  /// Jira issue type; empty otherwise.
+  final String type;
+
+  /// "Highest" … "Lowest" (Trello: from labels like "urgent" or "high").
+  final String priority;
+
+  /// Jira project or Trello board name.
+  final String place;
+  final DateTime? due;
+
+  /// When it became yours (Jira only).
+  final DateTime? assignedAt;
+  final int? originalEstimateMinutes;
+  final int? remainingEstimateMinutes;
+  final int? timeSpentMinutes;
+
+  /// Recent work: the last day it was tracked, and on how many days lately.
+  final DateTime? lastWorked;
+  final int daysWorked;
+
+  final JiraIssue? jira;
+  final TrelloCard? trello;
+
+  int get priorityRank => jiraPriorityRank(priority);
+
+  /// "CDEV-12 Fix login", "#42 Fix login" or "Fix login".
+  String get displayName => label.isEmpty ? title : '$label $title';
+
+  /// For messages: the label, else the title shortened.
+  String get shortName => label.isNotEmpty
+      ? label
+      : title.length > 40
+          ? '"${title.substring(0, 39)}…"'
+          : '"$title"';
+
+  factory PlanTask.fromJira(JiraIssue issue) => PlanTask(
+        source: TaskSource.jira,
+        ref: issue.key.toUpperCase(),
+        label: issue.key,
+        title: issue.summary,
+        description: issue.fullDescription.isNotEmpty ? issue.fullDescription : issue.description,
+        status: issue.status,
+        statusCategory: issue.statusCategory,
+        type: issue.issueType,
+        priority: issue.priority,
+        place: issue.projectName,
+        due: issue.dueDate,
+        assignedAt: issue.assignedAt,
+        originalEstimateMinutes: issue.originalEstimateMinutes,
+        remainingEstimateMinutes: issue.remainingEstimateMinutes,
+        timeSpentMinutes: issue.timeSpentMinutes,
+        jira: issue,
+      );
+
+  factory PlanTask.fromTrello(TrelloCard card) {
+    final list = card.listName;
+    return PlanTask(
+      source: TaskSource.trello,
+      ref: 'TRELLO-${card.id.toUpperCase()}',
+      label: card.idShort == null ? '' : '#${card.idShort}',
+      title: card.name,
+      description: card.shortDescription,
+      status: list,
+      statusCategory: _trelloDone.hasMatch(list)
+          ? 'done'
+          : _trelloDoing.hasMatch(list)
+              ? 'indeterminate'
+              : 'new',
+      priority: _trelloPriority(card),
+      place: card.boardName,
+      due: card.due == null || card.dueComplete ? null : card.due!.toLocal(),
+      trello: card,
+    );
+  }
+}
+
+final _trelloDone = RegExp(r'\b(done|complete|completed|closed|finished|shipped|released|archived?)\b',
+    caseSensitive: false);
+final _trelloDoing = RegExp(r'doing|progress|\bwip\b|working|develop|current|started|active', caseSensitive: false);
+
+/// Trello has no priority field; labels often stand in for one.
+String _trelloPriority(TrelloCard card) {
+  final names = card.labels.map((l) => l.name.toLowerCase()).join(' ');
+  if (RegExp(r'urgent|critical|blocker|highest|asap|p0').hasMatch(names)) return 'Highest';
+  if (RegExp(r'\bhigh|important|p1').hasMatch(names)) return 'High';
+  if (RegExp(r'\blow|minor|nice to have|p3').hasMatch(names)) return 'Low';
+  return '';
+}
+
 /// One task in the plan, with why it's there and how long to give it.
 class PlanItem {
   const PlanItem({
-    required this.issue,
+    required this.task,
     required this.score,
     required this.suggestedMinutes,
     required this.loggedMinutes,
@@ -23,7 +169,7 @@ class PlanItem {
     this.aiReason,
   });
 
-  final JiraIssue issue;
+  final PlanTask task;
 
   /// Higher goes first.
   final int score;
@@ -31,7 +177,7 @@ class PlanItem {
   /// Time to give it today.
   final int suggestedMinutes;
 
-  /// Time already tracked against it (entries whose title has its key).
+  /// Time already tracked against it (entries that name it).
   final int loggedMinutes;
   final int loggedTodayMinutes;
 
@@ -45,7 +191,7 @@ class PlanItem {
   final String? aiReason;
 
   PlanItem copyWith({int? suggestedMinutes, String? aiReason}) => PlanItem(
-        issue: issue,
+        task: task,
         score: score,
         suggestedMinutes: suggestedMinutes ?? this.suggestedMinutes,
         loggedMinutes: loggedMinutes,
@@ -76,6 +222,7 @@ class DayPlan {
     required this.nudges,
     this.capacityMinutes = dayCapacityMinutes,
     this.aiNote,
+    this.related = const [],
   });
 
   final DateTime day;
@@ -97,29 +244,69 @@ class DayPlan {
   /// Claude's advice for the day, when the plan came from Claude.
   final String? aiNote;
 
+  /// Jira issues your entries name that aren't to plan (done, or no longer
+  /// on your list), so the standup can still say where they are now.
+  final List<PlanTask> related;
+
+  List<PlanItem> get all => [...today, ...later, ...waiting];
   int get plannedMinutes => today.fold(0, (sum, i) => sum + i.suggestedMinutes);
   int get freeMinutes => math.max(0, capacityMinutes - trackedMinutes - plannedMinutes);
   bool get fromClaude => aiNote != null;
 }
 
 final _waitingStatus = RegExp(r'review|test|qa\b|verif|approv|block|waiting|on hold', caseSensitive: false);
+final _blockedStatus = RegExp(r'block|on hold|waiting|impediment', caseSensitive: false);
 
 /// In a column where the next move is someone else's (review, QA, blocked…).
 bool isWaitingStatus(JiraIssue issue) => _waitingStatus.hasMatch(issue.status);
+bool _isWaiting(PlanTask task) => task.status.isNotEmpty && _waitingStatus.hasMatch(task.status);
+
+final _anyJiraKey = RegExp(r'(^|[^A-Za-z0-9])([A-Z][A-Z0-9]+-[0-9]+)(?![0-9])');
+
+/// Jira keys named in [text] ("CDEV-12 fix" → CDEV-12).
+Iterable<String> jiraKeysIn(String text) => _anyJiraKey.allMatches(text).map((m) => m.group(2)!);
+
+/// Jira keys in the titles of entries from the last [recentWorkDays] days.
+Set<String> recentJiraKeys(List<TimeEntry> entries, DateTime now) {
+  final since = dateKey(dateOnly(now).subtract(const Duration(days: recentWorkDays)));
+  return {
+    for (final e in entries)
+      if (e.date.compareTo(since) >= 0) ...jiraKeysIn(e.taskTitle),
+  };
+}
 
 /// Whether [title] mentions [key] as a whole key ("CDEV-12" but not "CDEV-123").
 bool titleHasKey(String title, String key) =>
     RegExp('(^|[^A-Za-z0-9])${RegExp.escape(key)}(?![0-9])', caseSensitive: false).hasMatch(title);
 
+String _normalize(String text) => text.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
+
+/// Whether [entry] is time spent on [task].
+bool entryIsFor(TimeEntry entry, PlanTask task) => switch (task.source) {
+      TaskSource.jira => titleHasKey(entry.taskTitle, task.label),
+      TaskSource.trello => _isForCard(entry, task.trello!),
+      TaskSource.entries => _normalize(entry.taskTitle) == _normalize(task.title),
+    };
+
+bool _isForCard(TimeEntry entry, TrelloCard card) {
+  final name = _normalize(card.name);
+  final title = _normalize(entry.taskTitle);
+  if (name.length >= 4 && (title == name || title.contains(name))) return true;
+  return card.url.isNotEmpty && (entry.description ?? '').contains(card.url);
+}
+
 int _roundTo15(int minutes) => math.max(15, (minutes / 15).round() * 15);
 
 /// Time to give [issue] today: what's left of its estimate, else a typical
 /// amount for its type; between 30m and 4h.
-int suggestedMinutesFor(JiraIssue issue, int loggedMinutes) {
-  final spent = issue.timeSpentMinutes ?? loggedMinutes;
-  final left = issue.remainingEstimateMinutes ??
-      (issue.originalEstimateMinutes != null ? issue.originalEstimateMinutes! - spent : null);
-  final type = issue.issueType.toLowerCase();
+int suggestedMinutesFor(JiraIssue issue, int loggedMinutes) =>
+    _suggestedMinutes(PlanTask.fromJira(issue), loggedMinutes);
+
+int _suggestedMinutes(PlanTask task, int loggedMinutes) {
+  final spent = task.timeSpentMinutes ?? loggedMinutes;
+  final left = task.remainingEstimateMinutes ??
+      (task.originalEstimateMinutes != null ? task.originalEstimateMinutes! - spent : null);
+  final type = task.type.toLowerCase();
   final typical = type.contains('bug')
       ? 90
       : type.contains('sub')
@@ -131,16 +318,85 @@ int suggestedMinutesFor(JiraIssue issue, int loggedMinutes) {
   return _roundTo15(minutes.clamp(30, 240));
 }
 
-/// Builds today's plan from the user's Jira tasks and tracked time.
+/// Meetings and other routine entries aren't work to plan.
+final _routine = RegExp(
+    r'\b(stand-?ups?|daily|meetings?|calls?|syncs?|retros?|retrospectives?|planning|1:1s?|one on ones?|lunch|breaks?|interviews?|grooming|refinement|demos?)\b',
+    caseSensitive: false);
+
+/// How far back recent work is looked for.
+const recentWorkDays = 14;
+
+/// Work from your recent entries that isn't one of the [known] tasks, one
+/// task per title: its latest note becomes the description. With
+/// [jiraConnected], entries naming any Jira key belong to Jira (open or
+/// done), so they never count as recent work.
+List<PlanTask> recentWorkTasks(
+  List<TimeEntry> entries,
+  List<PlanTask> known,
+  DateTime now, {
+  bool jiraConnected = false,
+}) {
+  final today = dateOnly(now);
+  final since = dateKey(today.subtract(const Duration(days: recentWorkDays)));
+  final groups = <String, List<TimeEntry>>{};
+  for (final e in entries) {
+    final title = e.taskTitle.trim();
+    if (title.isEmpty || e.date.compareTo(since) < 0 || _routine.hasMatch(title)) continue;
+    if (jiraConnected && jiraKeysIn(title).isNotEmpty) continue;
+    if (known.any((t) => entryIsFor(e, t))) continue;
+    groups.putIfAbsent(_normalize(title), () => []).add(e);
+  }
+  return [
+    for (final list in groups.values)
+      () {
+        list.sort((a, b) {
+          final byDate = b.date.compareTo(a.date);
+          return byDate != 0 ? byDate : (b.createdAt ?? DateTime(0)).compareTo(a.createdAt ?? DateTime(0));
+        });
+        final note = list.map((e) => e.description?.trim() ?? '').firstWhere((d) => d.isNotEmpty, orElse: () => '');
+        final days = list.map((e) => e.date).toSet().length;
+        final last = parseDateKey(list.first.date);
+        return PlanTask(
+          source: TaskSource.entries,
+          ref: 'WORK-${_hash(_normalize(list.first.taskTitle))}',
+          title: list.first.taskTitle.trim(),
+          description: note,
+          statusCategory: today.difference(last).inDays <= 3 ? 'indeterminate' : 'new',
+          place: list.first.project?.name ?? '',
+          lastWorked: last,
+          daysWorked: days,
+        );
+      }(),
+  ];
+}
+
+/// Short, stable id for a title (FNV-1a), so Claude can refer to it.
+String _hash(String text) {
+  var h = 0x811c9dc5;
+  for (final c in text.codeUnits) {
+    h ^= c;
+    h = (h * 0x01000193) & 0xffffffff;
+  }
+  return h.toRadixString(16).toUpperCase().padLeft(8, '0');
+}
+
+/// Builds today's plan from your Jira issues, Trello cards and the work in
+/// your recent entries, and the time already tracked.
 ///
 /// Tasks are ranked by priority, being in progress, due date, how long
-/// they've been yours and whether you've touched them today, then fill the
-/// day's free time. Tasks waiting on review/test are listed apart.
+/// they've been yours and whether you've touched them today (recent work by
+/// how recently you worked on it), then fill the day's free time. Tasks
+/// waiting on review/test are listed apart.
 DayPlan buildDayPlan({
-  required List<JiraIssue> issues,
+  List<JiraIssue> issues = const [],
+  List<TrelloCard> cards = const [],
+  List<JiraIssue> relatedIssues = const [],
+  bool jiraConnected = false,
   required List<TimeEntry> entries,
   required DateTime now,
   String? myAccountId,
+  String? trelloMemberId,
+  bool includeRecentWork = true,
   int runningMinutes = 0,
   int localEntryCount = 0,
 }) {
@@ -149,11 +405,33 @@ DayPlan buildDayPlan({
   final tracked = entries.where((e) => e.date == todayKey).fold<int>(0, (sum, e) => sum + e.totalMinutes) +
       runningMinutes;
 
+  final known = <PlanTask>[
+    for (final issue in issues) PlanTask.fromJira(issue),
+    for (final card in cards)
+      // Only cards on you (when we know who you are).
+      if (trelloMemberId == null || trelloMemberId.isEmpty || card.memberIds.contains(trelloMemberId))
+        PlanTask.fromTrello(card),
+  ];
+  // Issues your entries name that aren't on your open list: never planned,
+  // but they keep that work out of "recent work" and tell the standup
+  // where it is now.
+  final openKeys = {for (final i in issues) i.key.toUpperCase()};
+  final related = [
+    for (final i in relatedIssues)
+      if (!openKeys.contains(i.key.toUpperCase())) PlanTask.fromJira(i),
+  ];
+  final tasks = [
+    ...known,
+    if (includeRecentWork)
+      ...recentWorkTasks(entries, [...known, ...related], now,
+          jiraConnected: jiraConnected || issues.isNotEmpty || relatedIssues.isNotEmpty),
+  ];
+
   final candidates = <PlanItem>[];
   final waiting = <PlanItem>[];
-  for (final issue in issues) {
-    if (issue.statusCategory == 'done') continue;
-    final mine = [for (final e in entries) if (titleHasKey(e.taskTitle, issue.key)) e];
+  for (final task in tasks) {
+    if (task.statusCategory == 'done') continue;
+    final mine = [for (final e in entries) if (entryIsFor(e, task)) e];
     final logged = mine.fold<int>(0, (sum, e) => sum + e.totalMinutes);
     final loggedToday = mine.where((e) => e.date == todayKey).fold<int>(0, (sum, e) => sum + e.totalMinutes);
     mine.sort((a, b) {
@@ -162,62 +440,80 @@ DayPlan buildDayPlan({
     });
 
     final reasons = <String>[];
-    var score = switch (issue.priorityRank) {
-      0 => 50,
-      1 => 40,
-      2 => 25,
-      3 => 12,
-      _ => 5,
-    };
-    if (issue.priorityRank <= 1 && issue.priority.isNotEmpty) reasons.add('${issue.priority} priority');
-    if (issue.statusCategory == 'indeterminate' && !isWaitingStatus(issue)) {
-      score += 30;
-      reasons.add('In progress');
-    }
-    final due = issue.dueDate == null ? null : dateOnly(issue.dueDate!);
-    if (due != null) {
-      final days = due.difference(today).inDays;
-      if (days < 0) {
-        score += 45;
-        reasons.add('Overdue ${-days}d');
-      } else if (days == 0) {
-        score += 40;
-        reasons.add('Due today');
-      } else if (days == 1) {
+    var score = 0;
+    int suggested;
+    if (task.source == TaskSource.entries) {
+      // Recent work: carry on with what you were doing.
+      final daysAgo = today.difference(task.lastWorked ?? today).inDays;
+      score = 15 + (daysAgo <= 1 ? 25 : daysAgo <= 3 ? 15 : 0) + math.min(task.daysWorked, 5) * 2;
+      reasons.add(switch (daysAgo) {
+        0 => 'Worked on today',
+        1 => 'Worked on yesterday',
+        _ => 'Last worked ${DateFormat('EEE d').format(task.lastWorked!)}',
+      });
+      // About what a day of it usually takes.
+      final perDay = task.daysWorked == 0 ? 120 : logged ~/ task.daysWorked;
+      suggested = _roundTo15(perDay.clamp(30, 240));
+    } else {
+      score = switch (task.priorityRank) {
+        0 => 50,
+        1 => 40,
+        2 => 25,
+        3 => 12,
+        _ => 5,
+      };
+      if (task.priorityRank <= 1 && task.priority.isNotEmpty) reasons.add('${task.priority} priority');
+      if (task.statusCategory == 'indeterminate' && !_isWaiting(task)) {
         score += 30;
-        reasons.add('Due tomorrow');
-      } else if (days <= 3) {
-        score += 20;
-        reasons.add('Due in ${days}d');
-      } else if (days <= 7) {
-        score += 10;
-        reasons.add('Due ${DateFormat('EEE').format(due)}');
+        reasons.add('In progress');
       }
-    }
-    final assigned = issue.assigneeAccountId != null && issue.assigneeAccountId == myAccountId
-        ? issue.assignedAt
-        : null;
-    final age = assigned == null ? 0 : today.difference(dateOnly(assigned.toLocal())).inDays;
-    score += math.min(age, 30) ~/ 3;
-    if (age >= 7) reasons.add('Yours ${age}d');
-    if (loggedToday > 0) {
-      score += 8;
-      reasons.add('Worked on today');
+      final due = task.due == null ? null : dateOnly(task.due!);
+      if (due != null) {
+        final days = due.difference(today).inDays;
+        if (days < 0) {
+          score += 45;
+          reasons.add('Overdue ${-days}d');
+        } else if (days == 0) {
+          score += 40;
+          reasons.add('Due today');
+        } else if (days == 1) {
+          score += 30;
+          reasons.add('Due tomorrow');
+        } else if (days <= 3) {
+          score += 20;
+          reasons.add('Due in ${days}d');
+        } else if (days <= 7) {
+          score += 10;
+          reasons.add('Due ${DateFormat('EEE').format(due)}');
+        }
+      }
+      final assigned = task.jira != null && task.jira!.assigneeAccountId != null &&
+              task.jira!.assigneeAccountId == myAccountId
+          ? task.assignedAt
+          : null;
+      final age = assigned == null ? 0 : today.difference(dateOnly(assigned.toLocal())).inDays;
+      score += math.min(age, 30) ~/ 3;
+      if (age >= 7) reasons.add('Yours ${age}d');
+      if (loggedToday > 0) {
+        score += 8;
+        reasons.add('Worked on today');
+      }
+      suggested = _suggestedMinutes(task, logged);
     }
 
     final item = PlanItem(
-      issue: issue,
+      task: task,
       score: score,
-      suggestedMinutes: suggestedMinutesFor(issue, logged),
+      suggestedMinutes: suggested,
       loggedMinutes: logged,
       loggedTodayMinutes: loggedToday,
       reasons: reasons,
       lastProjectId: mine.isEmpty ? null : mine.first.projectId,
     );
-    (isWaitingStatus(issue) ? waiting : candidates).add(item);
+    (_isWaiting(task) ? waiting : candidates).add(item);
   }
 
-  // Highest score first; ties keep Jira's order (recently updated first).
+  // Highest score first; ties keep the sources' order (recently updated first).
   final ranked = [for (var i = 0; i < candidates.length; i++) (i, candidates[i])]
     ..sort((a, b) {
       final byScore = b.$2.score.compareTo(a.$2.score);
@@ -245,12 +541,15 @@ DayPlan buildDayPlan({
     waiting: waiting,
     nudges: _nudges(
       all: [...candidates, ...waiting],
-      inProgress: candidates.where((i) => i.issue.statusCategory == 'indeterminate').length,
+      inProgress: candidates
+          .where((i) => i.task.source != TaskSource.entries && i.task.statusCategory == 'indeterminate')
+          .length,
       tracked: tracked,
       today: today,
       myAccountId: myAccountId,
       localEntryCount: localEntryCount,
     ),
+    related: related,
   );
 }
 
@@ -262,10 +561,10 @@ List<PlanNudge> _nudges({
   required String? myAccountId,
   required int localEntryCount,
 }) {
-  String listKeys(List<String> keys) => switch (keys.length) {
-        1 => keys[0],
-        2 => '${keys[0]} and ${keys[1]}',
-        _ => '${keys[0]}, ${keys[1]} and ${keys.length - 2} more',
+  String listNames(List<String> names) => switch (names.length) {
+        1 => names[0],
+        2 => '${names[0]} and ${names[1]}',
+        _ => '${names[0]}, ${names[1]} and ${names.length - 2} more',
       };
 
   final nudges = <PlanNudge>[];
@@ -278,13 +577,13 @@ List<PlanNudge> _nudges({
 
   final overdue = [
     for (final i in all)
-      if (i.issue.dueDate != null && dateOnly(i.issue.dueDate!).isBefore(today)) i,
+      if (i.task.due != null && dateOnly(i.task.due!).isBefore(today)) i,
   ];
   if (overdue.length == 1) {
-    final due = DateFormat('MMM d').format(overdue.first.issue.dueDate!);
-    nudges.add(PlanNudge(NudgeKind.overdue, '${overdue.first.issue.key} is overdue (was due $due).'));
+    final due = DateFormat('MMM d').format(overdue.first.task.due!);
+    nudges.add(PlanNudge(NudgeKind.overdue, '${overdue.first.task.shortName} is overdue (was due $due).'));
   } else if (overdue.length > 1) {
-    nudges.add(PlanNudge(NudgeKind.overdue, '${listKeys([for (final i in overdue) i.issue.key])} are overdue.'));
+    nudges.add(PlanNudge(NudgeKind.overdue, '${listNames([for (final i in overdue) i.task.shortName])} are overdue.'));
   }
 
   if (inProgress >= 3) {
@@ -296,30 +595,30 @@ List<PlanNudge> _nudges({
 
   final stale = <PlanItem>[];
   for (final i in all) {
-    final assigned = i.issue.assigneeAccountId == myAccountId ? i.issue.assignedAt : null;
-    if (assigned == null || i.loggedMinutes > 0 || (i.issue.timeSpentMinutes ?? 0) > 0) continue;
+    final assigned = i.task.jira?.assigneeAccountId == myAccountId ? i.task.assignedAt : null;
+    if (assigned == null || i.loggedMinutes > 0 || (i.task.timeSpentMinutes ?? 0) > 0) continue;
     if (today.difference(dateOnly(assigned.toLocal())).inDays >= 10) stale.add(i);
   }
   if (stale.length == 1) {
-    final days = today.difference(dateOnly(stale.first.issue.assignedAt!.toLocal())).inDays;
+    final days = today.difference(dateOnly(stale.first.task.assignedAt!.toLocal())).inDays;
     nudges.add(PlanNudge(
       NudgeKind.stale,
-      '${stale.first.issue.key} has been yours $days days with no time logged.',
+      '${stale.first.task.shortName} has been yours $days days with no time logged.',
     ));
   } else if (stale.length > 1) {
     nudges.add(PlanNudge(
       NudgeKind.stale,
-      '${listKeys([for (final i in stale) i.issue.key])} have been yours 10+ days with no time logged.',
+      '${listNames([for (final i in stale) i.task.shortName])} have been yours 10+ days with no time logged.',
     ));
   }
 
   for (final i in all) {
-    final estimate = i.issue.originalEstimateMinutes;
-    final spent = i.issue.timeSpentMinutes ?? i.loggedMinutes;
+    final estimate = i.task.originalEstimateMinutes;
+    final spent = i.task.timeSpentMinutes ?? i.loggedMinutes;
     if (estimate != null && estimate > 0 && spent > estimate * 1.25) {
       nudges.add(PlanNudge(
         NudgeKind.overrun,
-        '${i.issue.key}: ${formatMinutes(spent)} logged against a ${formatMinutes(estimate)} estimate.',
+        '${i.task.shortName}: ${formatMinutes(spent)} logged against a ${formatMinutes(estimate)} estimate.',
       ));
       break; // One is enough of a hint.
     }
@@ -378,8 +677,7 @@ List<ClaudePlanStep> parseClaudePlan(Map<String, dynamic> json) => [
 /// [plan] reordered by Claude: its picks (in its order and with its times)
 /// become today; everything else goes back to later / waiting.
 DayPlan applyClaudePlan(DayPlan plan, List<ClaudePlanStep> steps, String note) {
-  final all = [...plan.today, ...plan.later, ...plan.waiting];
-  final byKey = {for (final i in all) i.issue.key.toUpperCase(): i};
+  final byKey = {for (final i in plan.all) i.task.ref.toUpperCase(): i};
   final picked = <PlanItem>[];
   final used = <String>{};
   for (final step in steps) {
@@ -390,7 +688,7 @@ DayPlan applyClaudePlan(DayPlan plan, List<ClaudePlanStep> steps, String note) {
       aiReason: step.reason.isEmpty ? null : step.reason,
     ));
   }
-  bool rest(PlanItem i) => !used.contains(i.issue.key.toUpperCase());
+  bool rest(PlanItem i) => !used.contains(i.task.ref.toUpperCase());
   return DayPlan(
     day: plan.day,
     trackedMinutes: plan.trackedMinutes,
@@ -400,30 +698,38 @@ DayPlan applyClaudePlan(DayPlan plan, List<ClaudePlanStep> steps, String note) {
     waiting: plan.waiting.where(rest).toList(),
     nudges: plan.nudges,
     aiNote: note.trim().isEmpty ? 'Planned with Claude.' : note.trim(),
+    related: plan.related,
   );
 }
 
-/// What Claude gets to plan with: the tasks and the day so far.
+String _clip(String text, int max) => text.length > max ? '${text.substring(0, max)}…' : text;
+
+/// What Claude gets to plan with: every task (Jira, Trello, recent work with
+/// your notes) and the day so far.
 Map<String, dynamic> claudePlanInput(DayPlan plan, DateTime now) {
+  final today = dateOnly(now);
   Map<String, dynamic> task(PlanItem i, {required bool waiting}) {
-    final issue = i.issue;
-    final description = issue.fullDescription.isNotEmpty ? issue.fullDescription : issue.description;
+    final t = i.task;
     return {
-      'key': issue.key,
-      'title': issue.summary,
-      'type': issue.issueType,
-      'status': issue.status,
+      'key': t.ref,
+      'source': t.source.name,
+      if (t.label.isNotEmpty && t.label.toUpperCase() != t.ref) 'label': t.label,
+      'title': t.title,
+      if (t.type.isNotEmpty) 'type': t.type,
+      if (t.status.isNotEmpty) 'status': t.status,
       'waitingOnOthers': waiting,
-      'priority': issue.priority,
-      if (issue.dueDate != null) 'due': dateKey(issue.dueDate!),
-      if (issue.originalEstimateMinutes != null) 'estimateMinutes': issue.originalEstimateMinutes,
-      if (issue.remainingEstimateMinutes != null) 'remainingMinutes': issue.remainingEstimateMinutes,
-      'loggedMinutes': issue.timeSpentMinutes ?? i.loggedMinutes,
+      if (t.priority.isNotEmpty) 'priority': t.priority,
+      if (t.place.isNotEmpty) 'project': t.place,
+      if (t.due != null) 'due': dateKey(t.due!),
+      if (t.originalEstimateMinutes != null) 'estimateMinutes': t.originalEstimateMinutes,
+      if (t.remainingEstimateMinutes != null) 'remainingMinutes': t.remainingEstimateMinutes,
+      'loggedMinutes': t.timeSpentMinutes ?? i.loggedMinutes,
       'loggedTodayMinutes': i.loggedTodayMinutes,
-      if (issue.assignedAt != null)
-        'assignedDaysAgo': dateOnly(now).difference(dateOnly(issue.assignedAt!.toLocal())).inDays,
-      if (description.isNotEmpty)
-        'description': description.length > 300 ? '${description.substring(0, 300)}…' : description,
+      if (t.assignedAt != null) 'assignedDaysAgo': today.difference(dateOnly(t.assignedAt!.toLocal())).inDays,
+      if (t.lastWorked != null) 'lastWorkedDaysAgo': today.difference(t.lastWorked!).inDays,
+      if (t.daysWorked > 0) 'daysWorkedLately': t.daysWorked,
+      if (t.description.isNotEmpty)
+        (t.source == TaskSource.entries ? 'lastNote' : 'description'): _clip(t.description, 300),
     };
   }
 
@@ -440,34 +746,47 @@ Map<String, dynamic> claudePlanInput(DayPlan plan, DateTime now) {
 }
 
 const claudePlanInstruction =
-    'You are planning a software developer\'s working day. The JSON on stdin lists the Jira tasks '
-    'assigned to them, the time already tracked today and the free minutes left. Choose and order '
-    'the tasks to work on today; the minutes you give them must add up to no more than '
-    'freeMinutesToPlan. Prefer finishing work already in progress, then urgent priorities and due '
-    'dates; only include tasks waiting on others (review, test) if they likely need action. Give each '
-    'task a reason of at most 12 words. In "note", give one or two sentences of practical advice '
-    'for the day. Use only task keys from the input.';
+    'You are planning a software developer\'s working day. The JSON on stdin lists their tasks from up '
+    'to three sources: Jira issues ("jira"), Trello cards ("trello") and recent work found in their own '
+    'time entries ("entries", with the last note they wrote, or only a title). It also gives the time '
+    'already tracked today and the free minutes left. Choose and order the tasks to work on today; the '
+    'minutes you give them must add up to no more than freeMinutesToPlan. Prefer finishing work already '
+    'in progress, then urgent priorities and due dates. Use descriptions and notes to judge what is left: '
+    'skip recent work whose last note says it is finished, and continue work left half-done. If a Jira or '
+    'Trello task and recent work look like the same thing, plan the Jira or Trello one. Only include '
+    'tasks waiting on others (review, test) if they likely need action. Give each task a reason of at '
+    'most 12 words. In "note", give one or two sentences of practical advice for the day. Use only '
+    '"key" values from the input.';
 
 // ---------------------------------------------------------------------------
 // Standup
 
-/// One line of work for a standup: a task title with its total time.
+/// One line of work for a standup: a task title with its total time, and the
+/// Jira issue or Trello card it was on, when known.
 class StandupLine {
-  const StandupLine({required this.title, required this.minutes, this.description, this.project});
+  const StandupLine({required this.title, required this.minutes, this.description, this.project, this.task});
 
   final String title;
   final int minutes;
+
+  /// The note written on the entries (the first one found).
   final String? description;
   final String? project;
+
+  /// The Jira issue or Trello card, with its current status.
+  final PlanTask? task;
 }
 
-/// The previous working day's work, today's so far, and the plan.
+/// The previous working day's work, today's so far, the plan, and what's
+/// stuck.
 class StandupData {
   const StandupData({
     required this.previousDay,
     required this.previous,
     required this.today,
     required this.planned,
+    this.blocked = const [],
+    this.waiting = const [],
   });
 
   /// Most recent day before today with tracked time.
@@ -475,9 +794,15 @@ class StandupData {
   final List<StandupLine> previous;
   final List<StandupLine> today;
   final List<PlanItem> planned;
+
+  /// Tasks in a blocked / on-hold column.
+  final List<PlanItem> blocked;
+
+  /// Tasks waiting on review or test.
+  final List<PlanItem> waiting;
 }
 
-List<StandupLine> _linesFor(Iterable<TimeEntry> entries) {
+List<StandupLine> _linesFor(Iterable<TimeEntry> entries, List<PlanTask> tasks) {
   final byTitle = <String, List<TimeEntry>>{};
   for (final e in entries) {
     byTitle.putIfAbsent(e.taskTitle.trim(), () => []).add(e);
@@ -492,6 +817,7 @@ List<StandupLine> _linesFor(Iterable<TimeEntry> entries) {
       minutes: list.fold(0, (sum, e) => sum + e.totalMinutes),
       description: description.isEmpty ? null : description,
       project: list.first.project?.name,
+      task: tasks.where((t) => entryIsFor(list.first, t)).firstOrNull,
     ));
   });
   return lines..sort((a, b) => b.minutes.compareTo(a.minutes));
@@ -502,18 +828,36 @@ StandupData standupData(List<TimeEntry> entries, DayPlan plan, DateTime now) {
   final earlier = entries.where((e) => e.date.compareTo(todayKey) < 0).map((e) => e.date).toSet().toList()
     ..sort();
   final previousKey = earlier.isEmpty ? null : earlier.last;
+  // Lines link to Jira issues and Trello cards (recent work is the entries).
+  final tasks = [
+    for (final i in plan.all)
+      if (i.task.source != TaskSource.entries) i.task,
+    ...plan.related,
+  ];
+  bool blocked(PlanItem i) => _blockedStatus.hasMatch(i.task.status);
   return StandupData(
     previousDay: previousKey == null ? null : parseDateKey(previousKey),
-    previous: previousKey == null ? const [] : _linesFor(entries.where((e) => e.date == previousKey)),
-    today: _linesFor(entries.where((e) => e.date == todayKey)),
-    planned: plan.today.take(5).toList(),
+    previous: previousKey == null ? const [] : _linesFor(entries.where((e) => e.date == previousKey), tasks),
+    today: _linesFor(entries.where((e) => e.date == todayKey), tasks),
+    planned: plan.today.take(6).toList(),
+    blocked: plan.waiting.where(blocked).toList(),
+    waiting: plan.waiting.where((i) => !blocked(i)).toList(),
   );
 }
 
+/// Whether today's tracked [lines] already cover [item].
+bool _covers(List<StandupLine> lines, PlanItem item) => lines.any((l) =>
+    l.task?.ref == item.task.ref ||
+    (item.task.source == TaskSource.entries && _normalize(l.title) == _normalize(item.task.title)));
+
 /// A plain standup from the data, used as is or as Claude's starting point.
 String standupTemplate(StandupData data, DateTime now) {
-  String line(StandupLine l) =>
-      '• ${l.title}${l.description != null ? ' — ${l.description}' : ''} (${formatMinutes(l.minutes)})';
+  String line(StandupLine l) {
+    final status = l.task?.status ?? '';
+    return '• ${l.title}${l.description != null ? ' — ${l.description}' : ''} (${formatMinutes(l.minutes)})'
+        '${status.isNotEmpty ? ' · now $status' : ''}';
+  }
+
   final previousLabel = data.previousDay == null
       ? 'Yesterday'
       : formatDay(data.previousDay!, now: now) == 'Yesterday'
@@ -522,7 +866,7 @@ String standupTemplate(StandupData data, DateTime now) {
   final todayLines = <String>[
     for (final l in data.today) line(l),
     for (final p in data.planned)
-      if (!data.today.any((l) => titleHasKey(l.title, p.issue.key))) '• ${p.issue.key} ${p.issue.summary}',
+      if (!_covers(data.today, p)) '• ${p.task.displayName}',
   ];
   return [
     '$previousLabel:',
@@ -532,38 +876,58 @@ String standupTemplate(StandupData data, DateTime now) {
     if (todayLines.isEmpty) '• Nothing planned yet' else ...todayLines,
     '',
     'Blockers:',
-    '• None',
+    if (data.blocked.isEmpty)
+      '• None'
+    else
+      for (final b in data.blocked) '• ${b.task.displayName} (${b.task.status})',
   ].join('\n');
 }
 
-/// What Claude gets to write the standup from.
+/// What Claude gets to write the standup from: entries with your notes, the
+/// Jira issues and Trello cards they were on (current status), the plan, and
+/// what's blocked or waiting.
 Map<String, dynamic> standupInput(StandupData data, DateTime now) {
+  Map<String, dynamic> task(PlanTask t) => {
+        'source': t.source.name,
+        if (t.label.isNotEmpty) 'key': t.label,
+        'title': t.title,
+        if (t.status.isNotEmpty) 'status': t.status,
+        if (t.place.isNotEmpty) 'project': t.place,
+        if (t.due != null) 'due': dateKey(t.due!),
+      };
   Map<String, dynamic> work(StandupLine l) => {
         'title': l.title,
         'minutes': l.minutes,
-        if (l.description != null) 'description': l.description,
+        if (l.description != null) 'note': l.description,
         if (l.project != null) 'project': l.project,
+        if (l.task != null) 'task': task(l.task!),
       };
   return {
     'today': DateFormat('EEEE, yyyy-MM-dd').format(now),
     if (data.previousDay != null) 'previousWorkday': DateFormat('EEEE, yyyy-MM-dd').format(data.previousDay!),
-    'previousWorkdayEntries': [for (final l in data.previous) work(l)],
-    'todayEntriesSoFar': [for (final l in data.today) work(l)],
+    'previousWorkdayWork': [for (final l in data.previous) work(l)],
+    'todayWorkSoFar': [for (final l in data.today) work(l)],
     'plannedToday': [
       for (final p in data.planned)
         {
-          'key': p.issue.key,
-          'title': p.issue.summary,
-          'status': p.issue.status,
-          if (p.issue.dueDate != null) 'due': dateKey(p.issue.dueDate!),
+          ...task(p.task),
+          if (p.task.description.isNotEmpty)
+            (p.task.source == TaskSource.entries ? 'lastNote' : 'description'): _clip(p.task.description, 200),
         },
     ],
+    'blocked': [for (final b in data.blocked) task(b.task)],
+    'waitingOnOthers': [for (final w in data.waiting) task(w.task)],
   };
 }
 
 const standupInstruction =
-    'Write a short daily standup for a software developer from the JSON on stdin. Use exactly three '
-    'sections, "Yesterday:", "Today:" and "Blockers:" (if the previous workday was not yesterday, name '
-    'it, e.g. "Friday:"), each followed by plain-text bullets starting with "• ". Keep Jira keys, merge '
-    'related entries, keep it to about 8 bullets in total and skip durations unless useful. If no '
-    'blockers are evident, write "• None". Reply with only the standup text, no preamble.';
+    'Write a short daily standup that a software developer will read out on a team call, from the JSON '
+    'on stdin. It combines their time entries (titles and the notes they wrote), the Jira issues and '
+    'Trello cards that work was on (with their current status), today\'s plan, and what is blocked or '
+    'waiting on others. Use exactly three sections, "Yesterday:", "Today:" and "Blockers:" (if the '
+    'previous workday was not yesterday, name it, e.g. "Friday:"), each followed by bullets starting '
+    'with "• ". Write in the first person, in short natural sentences that are easy to say aloud. Say '
+    'what got done or how far it got, using the notes and current status (e.g. "it\'s in review now"), '
+    'not durations. Keep Jira keys, merge related entries, about 8 bullets in total. Under Blockers, '
+    'list blocked items and anything waiting on others that holds up work; otherwise write "• None". '
+    'Reply with only the standup text, no preamble.';

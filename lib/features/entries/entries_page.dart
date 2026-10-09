@@ -82,8 +82,59 @@ class _EntriesPageState extends State<EntriesPage> {
     ));
   }
 
+  /// Adds time by hand, without the timer.
+  Future<void> _addTime() => addTimeManually(context);
+
   /// Time-Wise entries being deleted, to show a spinner in their row.
   final Set<int> _deleting = {};
+
+  /// Entries being copied to Time-Wise: Time-Wise ids, or local entry ids.
+  final Set<Object> _copying = {};
+
+  /// Copies [entry] (or the [local] one behind it) to today, either straight
+  /// into Time-Wise or kept on this Mac.
+  Future<void> _copyForToday(
+    WorkspaceSession session,
+    TrackerController tracker,
+    TimeEntry entry,
+    PendingEntry? local, {
+    required bool toTimeWise,
+  }) async {
+    final key = local?.id ?? entry.id;
+    if (_copying.contains(key)) return;
+    final today = dateKey(DateTime.now());
+    final payload = local != null
+        ? {...local.payload, 'date': today}
+        : WorkspaceSession.entryPayload(entry, date: today);
+    final projectName = local?.projectName ?? entry.project?.name ?? '';
+    final messenger = ScaffoldMessenger.of(context);
+    final duration = local != null && local.underAMinute
+        ? '${local.seconds ?? 0}s'
+        : formatMinutes(entry.totalMinutes);
+
+    if (!toTimeWise) {
+      tracker.addLocal(payload, projectName: projectName, seconds: local?.seconds);
+      messenger.showSnackBar(SnackBar(
+        content: Text('Copied "${entry.taskTitle}" ($duration) to today, on this Mac.'),
+      ));
+      return;
+    }
+
+    setState(() => _copying.add(key));
+    try {
+      // Under a minute goes up as Time-Wise's minimum of one minute.
+      await session.createEntry(
+        local != null && local.underAMinute ? {...payload, 'minutes': 1} : payload,
+      );
+      messenger.showSnackBar(SnackBar(
+        content: Text('Copied "${entry.taskTitle}" ($duration) to today in Time-Wise.'),
+      ));
+    } on ApiException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text("Couldn't copy: ${e.message}")));
+    } finally {
+      if (mounted) setState(() => _copying.remove(key));
+    }
+  }
 
   /// After a confirmed delete, the snackbar still offers Undo.
   SnackBar _deletedSnackBar(String message, VoidCallback onUndo) => SnackBar(
@@ -231,6 +282,9 @@ class _EntriesPageState extends State<EntriesPage> {
         uploading: tracker.uploadingLocal,
         onUpload: (p) => _upload(tracker, p.id),
         deleting: _deleting,
+        copying: _copying,
+        onCopy: (e, p, toTimeWise) =>
+            _copyForToday(session, tracker, e, p, toTimeWise: toTimeWise),
         onDeleteLocal: (p) => _deleteLocal(tracker, p),
         onDeleteServer: (e) => _deleteServer(session, e),
         onEdit: _edit,
@@ -264,6 +318,12 @@ class _EntriesPageState extends State<EntriesPage> {
                       padding: EdgeInsets.only(left: 8),
                       child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
                     ),
+                  IconButton(
+                    tooltip: 'Add time',
+                    iconSize: 20,
+                    onPressed: session.trackableProjects.isEmpty ? null : _addTime,
+                    icon: const Icon(Icons.add),
+                  ),
                   IconButton(
                     tooltip: 'Refresh',
                     iconSize: 18,
@@ -465,6 +525,8 @@ class _EntryList extends StatelessWidget {
     required this.uploading,
     required this.onUpload,
     required this.deleting,
+    required this.copying,
+    required this.onCopy,
     required this.onDeleteLocal,
     required this.onDeleteServer,
     required this.onEdit,
@@ -483,6 +545,12 @@ class _EntryList extends StatelessWidget {
   final Set<int> deleting;
   final ValueChanged<TimeEntry> onDeleteServer;
 
+  /// Entries being copied to Time-Wise (Time-Wise ids or local ids).
+  final Set<Object> copying;
+
+  /// "Copy for today": into Time-Wise when `toTimeWise`, else on this Mac.
+  final void Function(TimeEntry entry, PendingEntry? local, bool toTimeWise) onCopy;
+
   /// Opens the editor; `local` is set for entries only on this Mac.
   final void Function(TimeEntry entry, PendingEntry? local) onEdit;
 
@@ -497,8 +565,10 @@ class _EntryList extends StatelessWidget {
       durationText: short ? '${local?.seconds ?? 0}s' : formatMinutes(entry.totalMinutes),
       uploadTooltip: short ? 'Upload to Time-Wise as 1m (its minimum)' : 'Upload to Time-Wise',
       local: local != null,
-      busy: local != null ? uploading.contains(local.id) : deleting.contains(entry.id),
+      busy: copying.contains(local?.id ?? entry.id) ||
+          (local != null ? uploading.contains(local.id) : deleting.contains(entry.id)),
       onUpload: local == null ? null : () => onUpload(local),
+      onCopy: (toTimeWise) => onCopy(entry, local, toTimeWise),
       onDelete: local == null ? () => onDeleteServer(entry) : () => onDeleteLocal(local),
       // Not while it's being uploaded or deleted.
       onTap: (local != null ? uploading.contains(local.id) : deleting.contains(entry.id))
@@ -568,6 +638,7 @@ class _EntryRow extends StatelessWidget {
     this.local = false,
     this.busy = false,
     this.onUpload,
+    this.onCopy,
     this.onDelete,
     this.onTap,
   });
@@ -587,6 +658,10 @@ class _EntryRow extends StatelessWidget {
   /// Being uploaded or deleted: a spinner replaces the actions.
   final bool busy;
   final VoidCallback? onUpload;
+
+  /// "Copy for today": `true` saves the copy to Time-Wise, `false` keeps it
+  /// on this Mac.
+  final ValueChanged<bool>? onCopy;
   final VoidCallback? onDelete;
 
   static const _compact = BoxConstraints.tightFor(width: 28, height: 28);
@@ -702,6 +777,7 @@ class _EntryRow extends StatelessWidget {
                               child: Icon(Icons.cloud_done_outlined, size: 14, color: muted),
                             ),
                           ),
+                        if (onCopy != null) _CopyForTodayButton(onCopy: onCopy!, constraints: _compact),
                         IconButton(
                           tooltip: local ? 'Delete from this Mac' : 'Delete from Time-Wise',
                           onPressed: onDelete,
@@ -856,6 +932,53 @@ class _OvertimeBadge extends StatelessWidget {
             fontSize: 10,
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Copy icon with a menu: copy the entry to today in Time-Wise or on this Mac.
+class _CopyForTodayButton extends StatelessWidget {
+  const _CopyForTodayButton({required this.onCopy, required this.constraints});
+
+  final ValueChanged<bool> onCopy;
+  final BoxConstraints constraints;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
+
+    Widget option(String title, String subtitle) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(title, style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+            Text(subtitle, style: theme.textTheme.labelSmall?.copyWith(color: muted)),
+          ],
+        );
+
+    return MenuAnchor(
+      menuChildren: [
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.cloud_upload_outlined, size: 20),
+          onPressed: () => onCopy(true),
+          child: option('Copy to Time-Wise', 'Dated today, upload now'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.laptop_mac_outlined, size: 20),
+          onPressed: () => onCopy(false),
+          child: option('Copy on this Mac', 'Dated today, upload later'),
+        ),
+      ],
+      builder: (context, menu, _) => IconButton(
+        tooltip: 'Copy for today',
+        onPressed: () => menu.isOpen ? menu.close() : menu.open(),
+        constraints: constraints,
+        padding: EdgeInsets.zero,
+        iconSize: 15,
+        color: muted,
+        icon: const Icon(Icons.content_copy),
       ),
     );
   }

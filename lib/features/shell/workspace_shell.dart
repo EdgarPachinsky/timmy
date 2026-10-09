@@ -1,14 +1,20 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/api_client.dart';
 import '../../core/clock.dart';
+import '../../core/format.dart';
 import '../../core/planner.dart';
+import '../../core/status_bar.dart';
 import '../../core/storage.dart';
 import '../../models/models.dart';
 import '../../state/auth_controller.dart';
 import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
+import '../../state/trello_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../state/workspaces_controller.dart';
 import '../entries/entries_page.dart';
@@ -16,6 +22,7 @@ import '../plan/plan_page.dart';
 import '../projects/projects_page.dart';
 import '../settings/settings_page.dart';
 import '../tracker/elapsed_text.dart';
+import '../tracker/tracker_logic.dart';
 import '../tracker/tracker_page.dart';
 import 'user_menu.dart';
 
@@ -71,6 +78,152 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
   static const _trackerIndex = 0;
   int _index = _trackerIndex;
 
+  // ---- Menu bar ------------------------------------------------------
+
+  late final StatusBarItem _statusBar = context.read<StatusBarItem>();
+  late final TrackerController _tracker = context.read<TrackerController>();
+  late final WorkspaceSession _session = context.read<WorkspaceSession>();
+  late final AppStorage _storage = context.read<AppStorage>();
+
+  /// Today's plan from the Plan tab; null until it has been built.
+  List<PlanItem>? _plan;
+  bool _publishQueued = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _statusBar.claim(this, _onStatusBarAction);
+    _tracker.addListener(_queuePublish);
+    _session.addListener(_queuePublish);
+    _queuePublish();
+  }
+
+  @override
+  void dispose() {
+    _tracker.removeListener(_queuePublish);
+    _session.removeListener(_queuePublish);
+    _statusBar.release(this);
+    super.dispose();
+  }
+
+  /// Several changes in a row go out as one update.
+  void _queuePublish() {
+    if (_publishQueued) return;
+    _publishQueued = true;
+    scheduleMicrotask(() {
+      _publishQueued = false;
+      if (mounted) _publish();
+    });
+  }
+
+  void _publish() {
+    final tracker = _tracker;
+    final now = DateTime.now();
+    final today = dateKey(now);
+    final todayMinutes = [
+      for (final e in _session.entries.data ?? const <TimeEntry>[])
+        if (e.date == today) e.totalMinutes,
+      for (final p in tracker.local)
+        if (p.date == today) p.minutes,
+    ].fold<int>(0, (sum, m) => sum + m);
+    final standup = _storage.lastStandup(widget.user.id);
+    final plan = _plan;
+
+    unawaited(_statusBar.update({
+      'signedIn': true,
+      if (tracker.isActive)
+        'timer': {
+          'label': statusBarLabel(tracker.taskTitle),
+          'title': tracker.taskTitle.trim(),
+          'project': tracker.projectName,
+          'running': tracker.isRunning,
+          'elapsedMs': tracker.elapsed.inMilliseconds,
+        },
+      'today': 'Tracked today: ${formatMinutes(todayMinutes)}',
+      if (plan != null)
+        'plan': [
+          for (final item in plan.take(8))
+            {
+              'title': ellipsize(item.task.displayName, 48),
+              'detail': formatMinutes(item.suggestedMinutes),
+            },
+        ],
+      if (standup != null)
+        'standup': {
+          'text': standup.text,
+          'when': dateOnly(standup.at) == dateOnly(now)
+              ? 'Today ${DateFormat.Hm().format(standup.at)}'
+              : DateFormat('EEE d MMM, HH:mm').format(standup.at),
+        },
+    }));
+  }
+
+  void _onPlan(List<PlanItem>? items) {
+    _plan = items;
+    _queuePublish();
+  }
+
+  void _onStandup(String text) {
+    unawaited(_storage.saveLastStandup(widget.user.id, text, DateTime.now()));
+    _queuePublish();
+  }
+
+  Future<void> _onStatusBarAction(String action) async {
+    final tracker = _tracker;
+    switch (action) {
+      case 'pause':
+        tracker.pause();
+      case 'resume':
+        tracker.resume();
+      case 'end_upload':
+        await _endFromStatusBar(upload: true);
+      case 'end_local':
+        await _endFromStatusBar(upload: false);
+      default:
+        final index = action.startsWith('plan:') ? int.tryParse(action.substring(5)) : null;
+        final plan = _plan;
+        if (index == null || plan == null || index >= plan.length) return;
+        _startFromPlan(plan[index]);
+        // No project to start on: the tracker is waiting for one.
+        if (!tracker.isActive) unawaited(_statusBar.showWindow());
+    }
+  }
+
+  /// End from the menu bar, with the same outcomes as the tracker's End.
+  Future<void> _endFromStatusBar({required bool upload}) async {
+    final tracker = _tracker;
+    final messenger = ScaffoldMessenger.of(context);
+    final elapsed = tracker.elapsed;
+    final project = tracker.projectName;
+    // The tracker form's text fields refresh from the controller.
+    tracker.externalEdits++;
+    final outcome = await tracker.end(upload: upload);
+    if (!mounted) return;
+    switch (outcome) {
+      case EndOutcome.saved:
+        messenger.showSnackBar(SnackBar(
+          content: Text('Saved ${formatMinutes(roundToMinutes(elapsed))} to $project'),
+        ));
+      case EndOutcome.keptLocally:
+        final duration =
+            elapsed.inSeconds < 60 ? '${elapsed.inSeconds}s' : formatMinutes(roundToMinutes(elapsed));
+        messenger.showSnackBar(SnackBar(
+          content: Text('Kept $duration on this Mac. Upload it from Entries.'),
+        ));
+      case EndOutcome.tooShort:
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Time-Wise needs at least a minute. Choose "Keep on this Mac" to save it locally.'),
+        ));
+        unawaited(_statusBar.showWindow());
+      case EndOutcome.invalid:
+        setState(() => _index = _trackerIndex);
+        messenger.showSnackBar(SnackBar(content: Text(tracker.invalidReason ?? 'Check the form.')));
+        unawaited(_statusBar.showWindow());
+      case EndOutcome.failed:
+        break; // The tracker's banner explains and offers a retry.
+    }
+  }
+
   void _trackProject(Project project) {
     final tracker = context.read<TrackerController>();
     if (tracker.isActive) {
@@ -89,7 +242,6 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
   void _startFromPlan(PlanItem item) {
     final tracker = context.read<TrackerController>();
     final session = context.read<WorkspaceSession>();
-    final jira = context.read<JiraController>();
     final messenger = ScaffoldMessenger.of(context);
     if (tracker.isActive) {
       messenger.showSnackBar(const SnackBar(content: Text('Finish the running timer first.')));
@@ -97,7 +249,13 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
     }
     final project = session.trackableProjects.where((p) => p.id == item.lastProjectId).firstOrNull ??
         session.trackableProjects.where((p) => p.id == tracker.projectId).firstOrNull;
-    final task = jira.taskFor(item.issue);
+    final t = item.task;
+    // The same title the task pickers would give it.
+    final ({String title, String? description}) task = t.jira != null
+        ? context.read<JiraController>().taskFor(t.jira!)
+        : t.trello != null
+            ? context.read<TrelloController>().taskFor(t.trello!)
+            : (title: t.title, description: null);
     tracker.prefill(
       project: project,
       title: task.title.length > 500 ? task.title.substring(0, 500) : task.title,
@@ -105,12 +263,12 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
     );
     setState(() => _index = _trackerIndex);
     if (project == null) {
-      messenger.showSnackBar(SnackBar(content: Text('Pick a project for ${item.issue.key}, then press Start.')));
+      messenger.showSnackBar(SnackBar(content: Text('Pick a project for ${t.shortName}, then press Start.')));
       return;
     }
     final problem = tracker.start();
     messenger.showSnackBar(SnackBar(
-      content: Text(problem ?? 'Started ${item.issue.key} on ${project.name}.'),
+      content: Text(problem ?? 'Started ${t.shortName} on ${project.name}.'),
     ));
   }
 
@@ -181,7 +339,7 @@ class _ShellScaffoldState extends State<_ShellScaffold> {
               children: [
                 const TrackerPage(),
                 const EntriesPage(),
-                PlanPage(onStart: _startFromPlan),
+                PlanPage(onStart: _startFromPlan, onPlan: _onPlan, onStandup: _onStandup),
               ],
             ),
           ),

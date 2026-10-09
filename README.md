@@ -43,7 +43,10 @@ runs, a small strip with the clock shows on the other tabs.
      **Save to Time-Wise** posts it now (`POST /workspaces/:id/time-entries`); **Keep on this Mac**
      stores it locally to review first. Local entries show in *Entries* with an upload (cloud) button,
      an *Upload all* banner and a delete button; entries already in Time-Wise show a cloud-check mark.
-   - **Discard** throws a timer away after confirmation.
+   - **Discard** throws a timer away after confirmation. The End menu offers the same as
+     **Stop without saving** (in red, below the two save options).
+   - **Add time** (after the timer status, or + in the *Entries* header) adds time by hand, without the timer: the entry
+     editor with a *Time-Wise / This Mac* switch for where it goes.
 4. **Projects** (folder icon in the top bar): everything you're assigned to, with a one-click
    **Track** button that returns to the tracker with that project selected.
 5. **Time entries** (`GET /workspaces/:id/time-entries?userId=`): grouped by day, with a project
@@ -95,18 +98,33 @@ page to browse them; a card's details show its labels, due date and description 
 
 ## Plan
 
-The **Plan** tab turns your Jira tasks into today's plan (`lib/core/planner.dart`):
+The **Plan** tab turns everything you have into today's plan (`lib/core/planner.dart`):
 
-- Tasks are ranked by priority, being in progress, due date (`duedate`), how long they've been yours
-  and whether you've worked on them today. Tasks in review / test / blocked columns are listed apart.
-- Each gets a time: what's left of its Jira estimate (`timetracking`), else a typical amount for its
-  type (bug 1h 30m, task 2h, story 3h), between 30m and 4h. They fill whatever is left of an 8h day
-  after the time already tracked (entries, local entries and a running timer); the rest goes to *Later*.
+- **Jira issues** (when connected), **Trello cards on you** (when connected: card members include you;
+  lists named *Done* are skipped, *Doing* counts as in progress, labels like *urgent* / *high* set
+  priority), and **recent work** from your own entries of the last 14 days that isn't one of those
+  tasks: one task per title, with your latest note as its description (meetings, standups and calls
+  are left out). With nothing connected the plan comes from recent work alone.
+- Tasks are ranked by priority, being in progress, due date, how long they've been yours and whether
+  you've worked on them today; recent work by how recently you worked on it. Tasks in review / test /
+  blocked columns are listed apart.
+- Each gets a time: what's left of its Jira estimate, else a typical amount for its type (bug 1h 30m,
+  task 2h, story 3h); recent work gets about what a day of it took. Between 30m and 4h, filling
+  whatever is left of an 8h day after the time already tracked; the rest goes to *Later*.
 - Heads-ups: overtime today, overdue tasks, 3+ tasks in progress, tasks yours for 10+ days with no
   time logged, time over the estimate, and entries only on this Mac.
-- Time logged on a task is found from entries whose title contains its key; **Start** fills the
-  tracker with the task and the project it was last tracked on, and starts the timer.
-- **Write standup** builds Yesterday / Today / Blockers from your entries and the plan.
+- Time on a task is found from entries naming it (the Jira key, or the Trello card's name);
+  **Start** fills the tracker with the task and the project it was last tracked on, and starts the
+  timer. The clock-plus button next to it **logs the planned time** instead: *Add time* opens with
+  the task, its planned hours, today and that project, to save to Time-Wise or keep on this Mac.
+  It greys out once the task has time today. **Log all to Time-Wise** (under today's plan) posts
+  every planned task without time yet in one go, each on its last project (else the tracker's),
+  with Undo.
+- **Ask Claude to plan** sends all of it (descriptions and your notes included), so Claude can skip
+  work your notes say is finished and merge a ticket with the matching recent work.
+- **Write standup** builds Yesterday / Today / Blockers from your entries and notes, the current status
+  of the Jira issues and Trello cards they were on ("· now In Review"), the plan, and blocked tasks.
+  With Claude connected it's written as short first-person sentences to read out on the call.
 
 ## Claude
 
@@ -115,6 +133,10 @@ on this Mac, with whoever is logged in to it, so no API key is needed. Timmy fin
 login shell (or a path you set), shows the account from `claude auth status`, and can **log in** (opens
 Terminal with `claude auth login`), **switch account** or **log out** (which signs Claude Code out on the
 whole Mac); **Disconnect from Timmy** only stops Timmy using it.
+
+With Claude connected, the entry editor's *Description* shows a ✨ button while it's empty: Claude
+writes a very short "what was done" (at most ~12 words) from the task's Jira issue or Trello card
+description, earlier notes on the same task, the project and the time.
 
 With Claude connected, the Plan tab can **Ask Claude to plan** (order and times with a reason per task,
 via `--json-schema`) and the standup is written by Claude. Each request runs
@@ -126,6 +148,21 @@ cost estimate, today and this month); plan limits are shown by `/usage` in Claud
 Because macOS sandboxed apps can't start other programs, Timmy now runs **without the app sandbox**
 (`com.apple.security.app-sandbox` is `false` in both entitlements files). On first launch it copies the
 preferences it stored while sandboxed (session, timers, local entries, Jira) out of its old container.
+
+## Menu bar
+
+Timmy puts a **t** in a circle in the macOS menu bar. While a timer exists it becomes a pill with the
+task and its time, e.g. `t CDEV-2345 22:34` (the Jira key when the title starts with one, else the
+title shortened); filled while running, outlined while paused. Its menu shows:
+
+- the running task with **Pause/Resume** and **End** (Save to Time-Wise / Keep on this Mac),
+- what's tracked today,
+- **Today's plan** from the Plan tab (with Jira connected); click a task to start it,
+- the **last standup** (saved when Claude writes it or you copy it), with **Copy standup**,
+- **Show Timmy** and **Quit Timmy**.
+
+It's drawn natively in `macos/Runner/StatusItemController.swift`; Flutter sends it the state over the
+`timmy/menu_bar` channel (`lib/core/status_bar.dart`) and the clock ticks on the native side.
 
 ## How the timer behaves
 

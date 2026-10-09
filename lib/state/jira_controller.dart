@@ -177,6 +177,28 @@ class JiraController extends ChangeNotifier {
     ];
   }
 
+  /// The issues with these [keys], whatever their status or assignee (e.g.
+  /// tickets named in your entries that are done by now). Keys Jira doesn't
+  /// know are left out.
+  Future<List<JiraIssue>> issuesByKeys(Iterable<String> keys) async {
+    final credentials = _credentials;
+    if (credentials == null) throw const JiraException('Connect Jira in Settings first.');
+    final list = {for (final k in keys) k.trim().toUpperCase()}.where(isJiraIssueKey).take(50).toList();
+    if (list.isEmpty) return const [];
+    try {
+      return await _client.search(credentials, jql: 'key in (${list.join(',')})', maxResults: list.length);
+    } on JiraException {
+      // One unknown key fails the whole query; ask for each on its own.
+      final found = await Future.wait([
+        for (final key in list)
+          _client
+              .search(credentials, jql: 'key = $key', maxResults: 1)
+              .catchError((Object _) => const <JiraIssue>[]),
+      ]);
+      return [for (final issues in found) ...issues];
+    }
+  }
+
   /// Link to the issue in Jira's web app.
   Uri? browseUrl(String issueKey) {
     final credentials = _credentials;

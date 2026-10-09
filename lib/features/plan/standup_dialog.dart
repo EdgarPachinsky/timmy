@@ -6,27 +6,49 @@ import 'package:flutter/services.dart';
 import '../../core/claude_cli.dart';
 import '../../core/planner.dart';
 import '../../state/claude_controller.dart';
+import 'step_progress.dart';
 
 /// A standup from yesterday's entries, today's so far and the plan. Starts
-/// from a plain template; with Claude connected, Claude writes it. Editable,
-/// with Copy.
+/// from a plain template of what's loaded; [prepare] then fetches fresh data
+/// step by step (shown under the title), and with Claude connected, Claude
+/// writes it. Editable, with Copy.
 Future<void> showStandupDialog(
   BuildContext context, {
   required ClaudeController claude,
   required StandupData data,
   required DateTime now,
+  ValueChanged<String>? onWritten,
+  Future<StandupData?> Function(StepRunner step)? prepare,
 }) =>
     showDialog<void>(
       context: context,
-      builder: (_) => _StandupDialog(claude: claude, data: data, now: now),
+      builder: (_) => _StandupDialog(
+        claude: claude,
+        data: data,
+        now: now,
+        onWritten: onWritten,
+        prepare: prepare,
+      ),
     );
 
 class _StandupDialog extends StatefulWidget {
-  const _StandupDialog({required this.claude, required this.data, required this.now});
+  const _StandupDialog({
+    required this.claude,
+    required this.data,
+    required this.now,
+    this.onWritten,
+    this.prepare,
+  });
 
   final ClaudeController claude;
   final StandupData data;
   final DateTime now;
+
+  /// A finished standup: Claude wrote it, or it was copied (as edited).
+  final ValueChanged<String>? onWritten;
+
+  /// Fetches fresh material, reporting each step.
+  final Future<StandupData?> Function(StepRunner step)? prepare;
 
   @override
   State<_StandupDialog> createState() => _StandupDialogState();
@@ -34,14 +56,22 @@ class _StandupDialog extends StatefulWidget {
 
 class _StandupDialogState extends State<_StandupDialog> {
   late final TextEditingController _text = TextEditingController(text: standupTemplate(widget.data, widget.now));
+  late StandupData _data = widget.data;
   bool _writing = false;
   bool _byClaude = false;
   String? _error;
 
+  /// The step being shown under the title while working.
+  ProgressStep? _progress;
+  late final StepRunner _step = stepRunner(
+    mounted: () => mounted,
+    show: (s) => setState(() => _progress = s),
+  );
+
   @override
   void initState() {
     super.initState();
-    if (widget.claude.isConnected) _askClaude();
+    _run(gather: true);
   }
 
   @override
@@ -50,34 +80,58 @@ class _StandupDialogState extends State<_StandupDialog> {
     super.dispose();
   }
 
-  Future<void> _askClaude() async {
+  /// With [gather], fresh data first (Jira, Trello, entries); then, with
+  /// Claude connected, Claude writes it. Every step shows under the title.
+  Future<void> _run({required bool gather}) async {
+    final prepare = widget.prepare;
+    if (!(gather && prepare != null) && !widget.claude.isConnected) return;
     setState(() {
       _writing = true;
       _error = null;
     });
     try {
-      final answer = await widget.claude.ask(
-        kind: 'standup',
-        instruction: standupInstruction,
-        input: const JsonEncoder.withIndent('  ').convert(standupInput(widget.data, widget.now)),
-      );
-      if (!mounted) return;
-      if (answer.text.isNotEmpty) {
-        setState(() {
-          _text.text = answer.text;
-          _byClaude = true;
+      if (gather && prepare != null) {
+        final data = await prepare(_step);
+        if (!mounted) return;
+        if (data != null) {
+          setState(() {
+            _data = data;
+            _text.text = standupTemplate(data, widget.now);
+          });
+        }
+      }
+      if (widget.claude.isConnected) {
+        await _step('Claude is writing your standup', () async {
+          final answer = await widget.claude.ask(
+            kind: 'standup',
+            instruction: standupInstruction,
+            input: const JsonEncoder.withIndent('  ').convert(standupInput(_data, widget.now)),
+          );
+          if (!mounted || answer.text.isEmpty) return false;
+          setState(() {
+            _text.text = answer.text;
+            _byClaude = true;
+          });
+          widget.onWritten?.call(answer.text);
+          return true;
         });
       }
     } on ClaudeException catch (e) {
       if (mounted) setState(() => _error = e.message);
     } finally {
-      if (mounted) setState(() => _writing = false);
+      if (mounted) {
+        setState(() {
+          _writing = false;
+          _progress = null;
+        });
+      }
     }
   }
 
   Future<void> _copy() async {
     final messenger = ScaffoldMessenger.of(context);
     await Clipboard.setData(ClipboardData(text: _text.text));
+    widget.onWritten?.call(_text.text);
     if (!mounted) return;
     Navigator.pop(context);
     messenger.showSnackBar(const SnackBar(content: Text('Standup copied.')));
@@ -87,7 +141,6 @@ class _StandupDialogState extends State<_StandupDialog> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final muted = scheme.onSurfaceVariant;
     return Dialog(
       insetPadding: const EdgeInsets.all(12),
       clipBehavior: Clip.antiAlias,
@@ -103,9 +156,7 @@ class _StandupDialogState extends State<_StandupDialog> {
                 children: [
                   Text('Standup', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                   const SizedBox(width: 8),
-                  if (_writing)
-                    Text('Claude is writing…', style: theme.textTheme.labelSmall?.copyWith(color: muted))
-                  else if (_byClaude)
+                  if (!_writing && _byClaude)
                     Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -124,7 +175,11 @@ class _StandupDialogState extends State<_StandupDialog> {
                 ],
               ),
             ),
-            SizedBox(height: 2, child: _writing ? const LinearProgressIndicator(minHeight: 2) : null),
+            // Gathering data and Claude writing, one step at a time.
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: StepProgress(step: _progress),
+            ),
             Flexible(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -157,7 +212,7 @@ class _StandupDialogState extends State<_StandupDialog> {
                 children: [
                   if (widget.claude.isConnected)
                     TextButton.icon(
-                      onPressed: _writing ? null : _askClaude,
+                      onPressed: _writing ? null : () => _run(gather: false),
                       icon: const Icon(Icons.auto_awesome, size: 16),
                       label: Text(_byClaude ? 'Rewrite' : 'Write with Claude'),
                     ),

@@ -5,6 +5,7 @@ import 'core/api_client.dart';
 import 'core/claude_cli.dart';
 import 'core/clock.dart';
 import 'core/jira_client.dart';
+import 'core/status_bar.dart';
 import 'core/storage.dart';
 import 'core/trello_client.dart';
 import 'features/auth/login_screen.dart';
@@ -26,6 +27,7 @@ class TimmyApp extends StatelessWidget {
     this.jira,
     this.claude,
     this.trello,
+    this.statusBar,
   });
 
   final ApiClient api;
@@ -43,6 +45,9 @@ class TimmyApp extends StatelessWidget {
   /// Defaults to the system clock.
   final Clock? clock;
 
+  /// Defaults to the real macOS menu bar item.
+  final StatusBarItem? statusBar;
+
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
@@ -52,6 +57,7 @@ class TimmyApp extends StatelessWidget {
         Provider<Clock>.value(value: clock ?? DateTime.now),
         Provider<JiraClient>(create: (_) => jira ?? JiraClient()),
         Provider<TrelloClient>(create: (_) => trello ?? TrelloClient()),
+        Provider<StatusBarItem>(create: (_) => statusBar ?? StatusBarItem()),
         // App-wide: the Claude Code login belongs to the Mac, not a Timmy user.
         ChangeNotifierProvider(
           create: (context) => ClaudeController(
