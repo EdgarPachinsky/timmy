@@ -3,13 +3,16 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/claude_cli.dart';
 import '../../core/format.dart';
 import '../../models/models.dart';
+import '../../state/claude_controller.dart';
 import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
 import '../../state/trello_controller.dart';
 import '../../state/workspace_session.dart';
 import '../../widgets/common.dart';
+import '../entries/describe_entry.dart';
 import '../entries/entry_editor.dart';
 import '../jira/jira_status_menu.dart';
 import '../settings/settings_page.dart';
@@ -185,6 +188,47 @@ class _TrackerPageState extends State<TrackerPage> {
     _confirmDiscard(tracker, resumeIfKept: resume);
   }
 
+  /// Claude is writing the description.
+  bool _describing = false;
+
+  /// Asks Claude for a very short "what was done" from the task (its Jira
+  /// issue or Trello card, earlier notes on it) and fills Description.
+  Future<void> _describe(TrackerController tracker) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final title = _title.text.trim();
+    if (title.isEmpty) {
+      messenger.showSnackBar(const SnackBar(
+        content: Text('Add a task title first, so Claude knows what the work is.'),
+      ));
+      return;
+    }
+    setState(() => _describing = true);
+    try {
+      final text = await describeEntryWithClaude(
+        claude: context.read<ClaudeController>(),
+        jira: context.read<JiraController>(),
+        trello: context.read<TrelloController>(),
+        entries: context.read<WorkspaceSession>().entries.data ?? const [],
+        title: title,
+        project: tracker.projectName,
+        minutes: tracker.isActive ? roundToMinutes(tracker.elapsed) : null,
+        date: tracker.startedAt ?? tracker.date ?? DateTime.now(),
+      );
+      if (!mounted) return;
+      if (text.isEmpty) {
+        messenger.showSnackBar(const SnackBar(content: Text("Claude didn't suggest anything. Try again or type it.")));
+      } else if (_description.text.trim().isEmpty) {
+        // Only if nothing was typed meanwhile.
+        _description.text = text;
+        tracker.setDescription(text);
+      }
+    } on ClaudeException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text("Claude couldn't write it: ${e.message}")));
+    } finally {
+      if (mounted) setState(() => _describing = false);
+    }
+  }
+
   Future<void> _confirmDiscard(TrackerController tracker, {bool resumeIfKept = false}) async {
     final discard = await showDialog<bool>(
       context: context,
@@ -268,6 +312,8 @@ class _TrackerPageState extends State<TrackerPage> {
                     description: _description,
                     onChanged: () => setState(() => _startProblem = null),
                     onPickTask: (position) => _pickTask(tracker, position),
+                    describing: _describing,
+                    onDescribe: context.watch<ClaudeController>().isConnected ? () => _describe(tracker) : null,
                   ),
                 ),
               ),
@@ -603,11 +649,19 @@ class _DetailsCard extends StatelessWidget {
     required this.description,
     required this.onChanged,
     required this.onPickTask,
+    this.describing = false,
+    this.onDescribe,
   });
 
   final TrackerController tracker;
   final TextEditingController title;
   final TextEditingController description;
+
+  /// Claude is writing the description.
+  final bool describing;
+
+  /// Ask Claude for the description; null when Claude isn't connected.
+  final VoidCallback? onDescribe;
   final VoidCallback onChanged;
   /// Pick a Jira task or Trello card; the menu (if any) opens at the position.
   final ValueChanged<RelativeRect> onPickTask;
@@ -688,10 +742,29 @@ class _DetailsCard extends StatelessWidget {
             gap,
             TextFormField(
               controller: description,
+              readOnly: describing,
               maxLength: 1000,
               minLines: 1,
               maxLines: 3,
-              decoration: _fieldDecoration('Description (optional)', Icons.notes).copyWith(counterText: ''),
+              decoration: _fieldDecoration('Description (optional)', Icons.notes).copyWith(
+                counterText: '',
+                // ✨ while it's empty: Claude writes what was done, from the task.
+                suffixIcon: onDescribe == null || (description.text.trim().isNotEmpty && !describing)
+                    ? null
+                    : describing
+                        ? const Padding(
+                            padding: EdgeInsets.all(10),
+                            child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                          )
+                        : IconButton(
+                            tooltip: 'Write what was done with Claude, from the task',
+                            iconSize: 18,
+                            color: theme.colorScheme.primary,
+                            icon: const Icon(Icons.auto_awesome),
+                            onPressed: onDescribe,
+                          ),
+                suffixIconConstraints: const BoxConstraints(minWidth: 36, minHeight: 34),
+              ),
               onChanged: tracker.setDescription,
             ),
             gap,

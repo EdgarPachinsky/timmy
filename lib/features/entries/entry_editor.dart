@@ -1,17 +1,11 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/api_client.dart';
 import '../../core/claude_cli.dart';
-import '../../core/entry_description.dart';
 import '../../core/format.dart';
-import '../../core/planner.dart' show jiraKeysIn;
-import '../../models/jira.dart';
 import '../../models/models.dart';
-import '../../models/trello.dart';
 import '../../state/claude_controller.dart';
 import '../../state/jira_controller.dart';
 import '../../state/tracker_controller.dart';
@@ -21,6 +15,7 @@ import '../../widgets/common.dart';
 import '../jira/jira_status_menu.dart';
 import '../tasks/task_picker.dart';
 import '../tracker/tracker_logic.dart';
+import 'describe_entry.dart';
 
 /// Starting values for "Add time" (e.g. a task from the plan, with its
 /// planned time). Anything left null gets the usual default.
@@ -231,43 +226,16 @@ class _EntryEditorState extends State<_EntryEditor> {
       _error = null;
     });
     try {
-      // The Jira issue the title names, and the Trello card it matches.
-      JiraIssue? issue;
-      final key = jiraKeysIn(title).firstOrNull;
-      if (key != null && widget.jira.isConnected) {
-        try {
-          issue = (await widget.jira.issuesByKeys([key])).firstOrNull;
-        } catch (_) {
-          // Without the issue, the title and notes still help.
-        }
-      }
-      TrelloCard? card;
-      if (issue == null && widget.trello.isConnected) {
-        try {
-          final norm = title.toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
-          card = (await widget.trello.findCards('')).where((c) {
-            final name = c.name.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
-            return name.length >= 4 && (norm == name || norm.contains(name));
-          }).firstOrNull;
-        } catch (_) {
-          // No card then; the title and notes still help.
-        }
-      }
-      final project = _projects.where((p) => p.id == _projectId).firstOrNull;
-      final answer = await widget.claude.ask(
-        kind: 'entry description',
-        instruction: entryDescriptionInstruction,
-        input: _prettyJson(entryDescriptionInput(
-          title: title,
-          project: project?.name,
-          minutes: _totalMinutes,
-          date: _date,
-          issue: issue,
-          card: card,
-          earlierNotes: earlierNotesFor(widget.session.entries.data ?? const [], title),
-        )),
+      final text = await describeEntryWithClaude(
+        claude: widget.claude,
+        jira: widget.jira,
+        trello: widget.trello,
+        entries: widget.session.entries.data ?? const [],
+        title: title,
+        project: _projects.where((p) => p.id == _projectId).firstOrNull?.name,
+        minutes: _totalMinutes,
+        date: _date,
       );
-      final text = cleanEntryDescription(answer.text);
       if (!mounted) return;
       if (text.isEmpty) {
         setState(() => _error = 'Claude didn\'t suggest anything. Try again or type it.');
@@ -714,6 +682,3 @@ InputDecoration _decoration(String label, IconData icon) => InputDecoration(
       prefixIcon: Icon(icon, size: 18),
       prefixIconConstraints: const BoxConstraints(minWidth: 38, minHeight: 36),
     );
-
-/// Indented so the input stays readable if someone inspects it.
-final _prettyJson = const JsonEncoder.withIndent('  ').convert;
